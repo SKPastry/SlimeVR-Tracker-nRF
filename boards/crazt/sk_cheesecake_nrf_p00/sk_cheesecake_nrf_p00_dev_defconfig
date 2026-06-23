@@ -1,0 +1,17 @@
+# Copyright (c) 2026
+# SPDX-License-Identifier: Apache-2.0
+
+CONFIG_ARM_MPU=y
+CONFIG_HW_STACK_PROTECTION=y
+
+CONFIG_SLIMEVR_USB_DEVICE_MANUFACTURER="SlimeVR"
+CONFIG_SLIMEVR_USB_DEVICE_PRODUCT="SlimeNRF Tracker SK CheeseCake NRF P00 Dev"
+
+CONFIG_BATTERY_USE_REG_LDO_MAPPING=y
+CONFIG_LED_RGB_COLOR=y
+CONFIG_LED_STRIP=y
+CONFIG_SPI=y
+
+# Development image: no UF2 bootloader, no SoftDevice, app starts at flash base.
+# CONFIG_BUILD_OUTPUT_UF2 is not set
+CONFIG_FLASH_LOAD_OFFSET=0x0
