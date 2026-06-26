@@ -7,6 +7,7 @@ on:
     branches:
       - main
       - dev
+      - dev-*
     tags:
       - "*"
   create:
@@ -210,6 +211,7 @@ jobs:
                   {boardname: "mochi_uf2/nrf52833", filename: "Mochi_Tracker"},
                   {boardname: "dawn_tracker_mini_uf2/nrf52833", filename: "Dawn_Tracker_Mini"},
                   {boardname: "aero_tracker_uf2/nrf52840", filename: "Aero_Tracker"},
+                  {boardname: "sk_cheesecake_nrf_p00/nrf52840/uf2", filename: "Crazt_SK_Cheesecake_NRF_P00_Tracker"},
                   {boardname: "kawazu_uf2/nrf52833", filename: "Kawazu_Tracker"},
                   {boardname: "nini_slimevr_mag_uf2/nrf52833", filename: "NiNi_SlimeVR_MAG_Tracker"},
                   {boardname: "nekonya_tracker_uf2/nrf52833", filename: "nekonya_tracker_uf2"}

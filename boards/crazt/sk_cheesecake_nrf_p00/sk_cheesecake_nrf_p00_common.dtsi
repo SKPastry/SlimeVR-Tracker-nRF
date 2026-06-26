@@ -5,19 +5,23 @@
 #include <zephyr/dt-bindings/led/led.h>
 
 &pinctrl {
-	spi2_default: spi2_default {
+	i2s0_default: i2s0_default {
 		group1 {
-			psels = <NRF_PSEL(SPIM_SCK, 1, 5)>,
-				<NRF_PSEL(SPIM_MOSI, 1, 4)>,
-				<NRF_PSEL_DISCONNECTED(SPIM_MISO)>;
+			psels = <NRF_PSEL(I2S_SCK_M, 1, 5)>,
+				<NRF_PSEL(I2S_LRCK_M, 1, 7)>,
+				<NRF_PSEL_DISCONNECTED(I2S_MCK)>,
+				<NRF_PSEL(I2S_SDOUT, 1, 4)>,
+				<NRF_PSEL_DISCONNECTED(I2S_SDIN)>;
 		};
 	};
 
-	spi2_sleep: spi2_sleep {
+	i2s0_sleep: i2s0_sleep {
 		group1 {
-			psels = <NRF_PSEL(SPIM_SCK, 1, 5)>,
-				<NRF_PSEL(SPIM_MOSI, 1, 4)>,
-				<NRF_PSEL_DISCONNECTED(SPIM_MISO)>;
+			psels = <NRF_PSEL(I2S_SCK_M, 1, 5)>,
+				<NRF_PSEL(I2S_LRCK_M, 1, 7)>,
+				<NRF_PSEL_DISCONNECTED(I2S_MCK)>,
+				<NRF_PSEL(I2S_SDOUT, 1, 4)>,
+				<NRF_PSEL_DISCONNECTED(I2S_SDIN)>;
 			low-power-enable;
 		};
 	};
@@ -133,27 +137,21 @@
 	status = "okay";
 };
 
-&spi2 {
-	compatible = "nordic,nrf-spim";
+&i2s0 {
 	status = "okay";
-	max-frequency = <DT_FREQ_M(4)>;
-	pinctrl-0 = <&spi2_default>;
-	pinctrl-1 = <&spi2_sleep>;
+	pinctrl-0 = <&i2s0_default>;
+	pinctrl-1 = <&i2s0_sleep>;
 	pinctrl-names = "default", "sleep";
 
 	led_strip: ws2812@0 {
-		compatible = "worldsemi,ws2812-spi";
+		compatible = "worldsemi,ws2812-i2s";
 		reg = <0>;
-		spi-max-frequency = <DT_FREQ_M(4)>;
 		chain-length = <1>;
 		color-mapping = <LED_COLOR_ID_GREEN
 				 LED_COLOR_ID_RED
 				 LED_COLOR_ID_BLUE>;
-		/* External level shifting inverts MOSI, so transmit inverted 5-bit symbols. */
-		bits-per-symbol = <5>;
-		spi-one-frame = <0x03>;
-		spi-zero-frame = <0x0f>;
-		reset-delay = <500>;
+		out-active-low;
+		reset-delay = <100>;
 	};
 };
 
