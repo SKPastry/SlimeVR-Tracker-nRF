@@ -1,0 +1,12 @@
+# Copyright (c) 2026
+# SPDX-License-Identifier: Apache-2.0
+
+config CRAZT_WS2812_STRIP_I2S
+	bool "Crazt WS2812 LED strip I2S driver"
+	default y
+	depends on DT_HAS_CRAZT_WS2812_I2S_ENABLED
+	select I2S if $(dt_compat_on_bus,$(DT_COMPAT_CRAZT_WS2812_I2S),i2s)
+	help
+	  Enable the project-local WS2812 (and compatible) LED strip driver
+	  using I2S. This driver mirrors the SDK WS2812 I2S driver so it can
+	  be maintained independently of the Zephyr SDK.

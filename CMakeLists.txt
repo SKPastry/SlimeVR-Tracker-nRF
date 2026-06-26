@@ -99,6 +99,8 @@ add_compile_definitions(
 find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
 project(NONE)
 
+add_subdirectory(drivers/led_strip)
+
 find_package(Python3 QUIET COMPONENTS Interpreter)
 
 if(NOT Python3_Interpreter_FOUND)

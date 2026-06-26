@@ -535,3 +535,5 @@ config CLOCK_CONTROL_NRF_K32SRC_RC_CALIBRATION
     default n
 
 source "Kconfig.zephyr"
+
+rsource "drivers/led_strip/Kconfig"
