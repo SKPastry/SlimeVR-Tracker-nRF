@@ -30,6 +30,8 @@ LOG_MODULE_REGISTER(crazt_ws2812_i2s);
 #include <zephyr/sys/util.h>
 
 #define WS2812_I2S_PRE_DELAY_WORDS 10 // crazt: change to 10 to reset DIN status.
+#define WS2812_I2S_MIN_FRAME_US 1000
+#define WS2812_I2S_RETRY_COUNT 1
 
 struct ws2812_i2s_cfg {
 	struct device const *dev;
@@ -44,6 +46,11 @@ struct ws2812_i2s_cfg {
 	bool active_low;
 	uint8_t nibble_one;
 	uint8_t nibble_zero;
+};
+
+struct ws2812_i2s_data {
+	struct k_mutex lock;
+	int64_t last_error_log_ms;
 };
 
 /* Serialize an 8-bit color channel value into two 16-bit I2S values (or 1 32-bit
@@ -62,25 +69,34 @@ static inline uint32_t ws2812_i2s_ser(uint8_t color, const uint8_t sym_one, cons
 	return (word >> 16) | (word << 16);
 }
 
-static int ws2812_strip_update_rgb(const struct device *dev, struct led_rgb *pixels,
-				   size_t num_pixels)
+static void ws2812_i2s_recover(const struct ws2812_i2s_cfg *cfg)
 {
-	const struct ws2812_i2s_cfg *cfg = dev->config;
+	int ret;
+
+	ret = i2s_trigger(cfg->dev, I2S_DIR_TX, I2S_TRIGGER_PREPARE);
+	if (ret == 0) {
+		return;
+	}
+
+	(void)i2s_trigger(cfg->dev, I2S_DIR_TX, I2S_TRIGGER_DROP);
+}
+
+static int ws2812_i2s_fill_buffer(const struct ws2812_i2s_cfg *cfg, struct led_rgb *pixels,
+				  size_t num_pixels, void **mem_block)
+{
 	const uint8_t sym_one = cfg->nibble_one;
 	const uint8_t sym_zero = cfg->nibble_zero;
 	const uint32_t reset_word = cfg->active_low ? ~0 : 0;
 	uint32_t *tx_buf;
-	uint32_t flush_time_us;
-	void *mem_block;
 	int ret;
 
 	/* Acquire memory for the I2S payload. */
-	ret = k_mem_slab_alloc(cfg->mem_slab, &mem_block, K_SECONDS(10));
+	ret = k_mem_slab_alloc(cfg->mem_slab, mem_block, K_SECONDS(10));
 	if (ret < 0) {
 		LOG_ERR("Unable to allocate mem slab for TX (err %d)", ret);
 		return -ENOMEM;
 	}
-	tx_buf = (uint32_t *)mem_block;
+	tx_buf = (uint32_t *)*mem_block;
 
 	/* Add a pre-data reset, so the first pixel isn't skipped by the strip. */
 	for (uint16_t i = 0; i < WS2812_I2S_PRE_DELAY_WORDS; i++) {
@@ -111,6 +127,8 @@ static int ws2812_strip_update_rgb(const struct device *dev, struct led_rgb *pix
 				pixel = pixels[i].b;
 				break;
 			default:
+				k_mem_slab_free(cfg->mem_slab, *mem_block);
+				*mem_block = NULL;
 				return -EINVAL;
 			}
 			*tx_buf = ws2812_i2s_ser(pixel, sym_one, sym_zero) ^ reset_word;
@@ -123,29 +141,84 @@ static int ws2812_strip_update_rgb(const struct device *dev, struct led_rgb *pix
 		tx_buf++;
 	}
 
+	return 0;
+}
+
+static int ws2812_i2s_transfer(const struct ws2812_i2s_cfg *cfg, void *mem_block)
+{
+	uint32_t flush_time_us;
+	int ret;
+
 	/* Flush the buffer on the wire. */
 	ret = i2s_write(cfg->dev, mem_block, cfg->tx_buf_bytes);
 	if (ret < 0) {
 		k_mem_slab_free(cfg->mem_slab, mem_block);
-		LOG_ERR("Failed to write data: %d", ret);
+		LOG_DBG("Failed to write data: %d", ret);
 		return ret;
 	}
 
 	ret = i2s_trigger(cfg->dev, I2S_DIR_TX, I2S_TRIGGER_START);
 	if (ret < 0) {
-		LOG_ERR("Failed to trigger command %d on TX: %d", I2S_TRIGGER_START, ret);
+		LOG_DBG("Failed to trigger command %d on TX: %d", I2S_TRIGGER_START, ret);
 		return ret;
 	}
 
 	ret = i2s_trigger(cfg->dev, I2S_DIR_TX, I2S_TRIGGER_DRAIN);
 	if (ret < 0) {
-		LOG_ERR("Failed to trigger command %d on TX: %d", I2S_TRIGGER_DRAIN, ret);
+		LOG_DBG("Failed to trigger command %d on TX: %d", I2S_TRIGGER_DRAIN, ret);
 		return ret;
 	}
 
 	/* Wait until transaction is over */
 	flush_time_us = cfg->lrck_period * cfg->tx_buf_bytes / sizeof(uint32_t);
 	k_usleep(flush_time_us + cfg->extra_wait_time_us);
+
+	return ret;
+}
+
+static int ws2812_strip_update_rgb(const struct device *dev, struct led_rgb *pixels,
+				   size_t num_pixels)
+{
+	const struct ws2812_i2s_cfg *cfg = dev->config;
+	struct ws2812_i2s_data *data = dev->data;
+	void *mem_block = NULL;
+	int ret = 0;
+
+	if (num_pixels > cfg->length) {
+		return -EINVAL;
+	}
+
+	k_mutex_lock(&data->lock, K_FOREVER);
+
+	for (uint8_t attempt = 0; attempt <= WS2812_I2S_RETRY_COUNT; attempt++) {
+		ret = ws2812_i2s_fill_buffer(cfg, pixels, num_pixels, &mem_block);
+		if (ret < 0) {
+			break;
+		}
+
+		ret = ws2812_i2s_transfer(cfg, mem_block);
+		mem_block = NULL;
+		if (ret == 0) {
+			break;
+		}
+
+		ws2812_i2s_recover(cfg);
+	}
+
+	if (ret < 0) {
+		int64_t now = k_uptime_get();
+
+		if (now - data->last_error_log_ms >= 1000) {
+			data->last_error_log_ms = now;
+			LOG_ERR("I2S update failed after retry: %d", ret);
+		}
+	}
+
+	if (mem_block != NULL) {
+		k_mem_slab_free(cfg->mem_slab, mem_block);
+	}
+
+	k_mutex_unlock(&data->lock);
 
 	return ret;
 }
@@ -160,9 +233,12 @@ static size_t ws2812_strip_length(const struct device *dev)
 static int ws2812_i2s_init(const struct device *dev)
 {
 	const struct ws2812_i2s_cfg *cfg = dev->config;
+	struct ws2812_i2s_data *data = dev->data;
 	struct i2s_config config;
 	uint32_t lrck_hz;
 	int ret;
+
+	k_mutex_init(&data->lock);
 
 	lrck_hz = USEC_PER_SEC / cfg->lrck_period;
 	LOG_DBG("Word clock: freq %u Hz period %u us", lrck_hz, cfg->lrck_period);
@@ -216,13 +292,28 @@ static DEVICE_API(led_strip, ws2812_i2s_api) = {
 
 #define WS2812_I2S_NUM_PIXELS(idx) (DT_INST_PROP(idx, chain_length))
 
+#define WS2812_I2S_DATA_WORDS(idx) (WS2812_NUM_COLORS(idx) * WS2812_I2S_NUM_PIXELS(idx))
+
+#define WS2812_I2S_MIN_FRAME_WORDS(idx)                                                           \
+	DIV_ROUND_UP(WS2812_I2S_MIN_FRAME_US, WS2812_I2S_LRCK_PERIOD_US(idx))
+
+#define WS2812_I2S_TRAILING_RESET_WORDS(idx)                                                       \
+	MAX(WS2812_RESET_DELAY_WORDS(idx),                                                        \
+	    (WS2812_I2S_MIN_FRAME_WORDS(idx) >                                                     \
+		     (WS2812_I2S_PRE_DELAY_WORDS + WS2812_I2S_DATA_WORDS(idx))                    \
+		     ? WS2812_I2S_MIN_FRAME_WORDS(idx) -                                           \
+			       WS2812_I2S_PRE_DELAY_WORDS - WS2812_I2S_DATA_WORDS(idx)             \
+		     : 0))
+
 #define WS2812_I2S_BUFSIZE(idx)                                                                    \
-	(((WS2812_NUM_COLORS(idx) * WS2812_I2S_NUM_PIXELS(idx)) +	                           \
-	  WS2812_I2S_PRE_DELAY_WORDS + WS2812_RESET_DELAY_WORDS(idx)) * 4)
+	((WS2812_I2S_DATA_WORDS(idx) + WS2812_I2S_PRE_DELAY_WORDS +                              \
+	  WS2812_I2S_TRAILING_RESET_WORDS(idx)) * 4)
 
 #define WS2812_I2S_DEVICE(idx)                                                                     \
 	                                                                                                   \
 	K_MEM_SLAB_DEFINE_STATIC(ws2812_i2s_##idx##_slab, WS2812_I2S_BUFSIZE(idx), 2, 4);          \
+	                                                                                                   \
+	static struct ws2812_i2s_data ws2812_i2s_##idx##_data;                                    \
 	                                                                                                   \
 	static const uint8_t ws2812_i2s_##idx##_color_mapping[] =                                  \
 		DT_INST_PROP(idx, color_mapping);                                                  \
@@ -236,13 +327,14 @@ static DEVICE_API(led_strip, ws2812_i2s_api) = {
 		.color_mapping = ws2812_i2s_##idx##_color_mapping,                                 \
 		.lrck_period = WS2812_I2S_LRCK_PERIOD_US(idx),                                     \
 		.extra_wait_time_us = DT_INST_PROP(idx, extra_wait_time),                          \
-		.reset_words = WS2812_RESET_DELAY_WORDS(idx),                                      \
+		.reset_words = WS2812_I2S_TRAILING_RESET_WORDS(idx),                               \
 		.active_low = DT_INST_PROP(idx, out_active_low),                                   \
 		.nibble_one = DT_INST_PROP(idx, nibble_one),                                       \
 		.nibble_zero = DT_INST_PROP(idx, nibble_zero),                                     \
 	};                                                                                         \
 	                                                                                                   \
-	DEVICE_DT_INST_DEFINE(idx, ws2812_i2s_init, NULL, NULL, &ws2812_i2s_##idx##_cfg,           \
+	DEVICE_DT_INST_DEFINE(idx, ws2812_i2s_init, NULL, &ws2812_i2s_##idx##_data,                \
+			      &ws2812_i2s_##idx##_cfg,                                            \
 			      POST_KERNEL, CONFIG_LED_STRIP_INIT_PRIORITY, &ws2812_i2s_api);
 
 DT_INST_FOREACH_STATUS_OKAY(WS2812_I2S_DEVICE)

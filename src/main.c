@@ -79,11 +79,14 @@ int main(void)
 #endif
 #endif
 
+	LOG_INF("Main: boot LED on");
 	set_led(SYS_LED_PATTERN_ON, SYS_LED_PRIORITY_BOOT); // Boot LED
 
 	uint8_t reboot_counter = reboot_counter_read();
 	bool booting_from_shutdown
 		= !reboot_counter && (reset_pin_reset || button_read()); // 0 means from user shutdown or failed ram validation
+	LOG_INF("Main: reset_pin_reset=%d button=%d reboot_counter=%u booting_from_shutdown=%d",
+		reset_pin_reset, button_read(), reboot_counter, booting_from_shutdown);
 
 	/* if button is not held after booting from shutdown, power off again
 	 * if button press is normal, continue boot
@@ -152,7 +155,10 @@ int main(void)
 #if USER_SHUTDOWN_ENABLED
 	bool charging = chg_read();
 	bool charged = stby_read();
+	LOG_INF("Main: startup power check before vin_read chg=%d stby=%d", charging, charged);
 	bool plugged = vin_read();
+	LOG_INF("Main: startup power state chg=%d stby=%d plugged=%d",
+		charging, charged, plugged);
 
 	if (reset_mode == 0 && !booting_from_shutdown && !charging && !charged
 		&& !plugged) { // Reset mode user shutdown, only if unplugged and undocked
@@ -162,6 +168,7 @@ int main(void)
 
 	if (!booting_from_shutdown) { // ONESHOT_POWERON automatically sets LED off
 		k_usleep(60);
+		LOG_INF("Main: clearing boot LED");
 		set_led(SYS_LED_PATTERN_OFF, SYS_LED_PRIORITY_BOOT);
 	}
 
