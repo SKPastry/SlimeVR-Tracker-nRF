@@ -70,6 +70,33 @@ K_THREAD_DEFINE(power_thread_id, 1024, power_thread, NULL, NULL, NULL, 6, 0, 0);
 
 #define ZEPHYR_USER_NODE DT_PATH(zephyr_user)
 
+#if DT_NODE_HAS_PROP(ZEPHYR_USER_NODE, plug_gpios)
+#define PLUG_EXISTS true
+static const struct gpio_dt_spec plug_gpio = GPIO_DT_SPEC_GET(ZEPHYR_USER_NODE, plug_gpios);
+#endif
+
+static const char *power_led_pattern_name(enum sys_led_pattern pattern)
+{
+	switch (pattern) {
+	case SYS_LED_PATTERN_OFF_FORCE:
+		return "OFF_FORCE";
+	case SYS_LED_PATTERN_OFF:
+		return "OFF";
+	case SYS_LED_PATTERN_ON:
+		return "ON";
+	case SYS_LED_PATTERN_ON_PERSIST:
+		return "ON_PERSIST";
+	case SYS_LED_PATTERN_LONG_PERSIST:
+		return "LONG_PERSIST";
+	case SYS_LED_PATTERN_PULSE_PERSIST:
+		return "PULSE_PERSIST";
+	case SYS_LED_PATTERN_ACTIVE_PERSIST:
+		return "ACTIVE_PERSIST";
+	default:
+		return "OTHER";
+	}
+}
+
 #if DT_NODE_HAS_PROP(ZEPHYR_USER_NODE, int0_gpios)
 #define IMU_INT_EXISTS true
 #else
@@ -653,6 +680,20 @@ static void power_thread(void)
 	static bool boot_success_checked = false;
 	static bool watchdog_registered = false;
 	static bool ota_gpregret_logged = false;
+	static bool power_diag_valid = false;
+#ifdef PLUG_EXISTS
+	static bool plug_gpio_configured = false;
+#endif
+	static bool last_charging = false;
+	static bool last_charged = false;
+	static bool last_inferred_plugged = false;
+	static bool last_usb_plugged = false;
+	static bool last_device_plugged = false;
+	static bool last_battery_low = false;
+	static bool last_docked = false;
+	static int last_battery_mV = 0;
+	static int last_plug_gpio_value = -1;
+	static enum sys_led_pattern last_system_led_pattern = SYS_LED_PATTERN_OFF;
 
 	/* Register power thread with watchdog (watchdog is initialized via SYS_INIT) */
 	if (!watchdog_registered) {
@@ -708,6 +749,22 @@ static void power_thread(void)
 		bool docked = dock_read();
 		bool charging = chg_read();
 		bool charged = stby_read();
+		int plug_gpio_value = -1;
+#ifdef PLUG_EXISTS
+		if (!plug_gpio_configured) {
+			int rc = -1;
+
+			if (device_is_ready(plug_gpio.port)) {
+				rc = gpio_pin_configure_dt(&plug_gpio, GPIO_INPUT);
+			}
+			plug_gpio_configured = true;
+			LOG_INF("Power diag: plug GPIO configure rc=%d ready=%d",
+				rc, device_is_ready(plug_gpio.port));
+		}
+		if (device_is_ready(plug_gpio.port)) {
+			plug_gpio_value = gpio_pin_get_dt(&plug_gpio);
+		}
+#endif
 
 		int battery_mV;
 		int16_t battery_pptt = read_batt_mV(&battery_mV);
@@ -780,6 +837,41 @@ static void power_thread(void)
 		else if (!battery_available || !current_battery_pptt_valid || (battery_low && current_battery_pptt > 1000)) // hysteresis alrerady provided
 			battery_low = false;
 
+		int battery_mV_delta = battery_mV - last_battery_mV;
+		if (battery_mV_delta < 0) {
+			battery_mV_delta = -battery_mV_delta;
+		}
+		bool power_diag_changed = !power_diag_valid
+			|| charging != last_charging
+			|| charged != last_charged
+			|| plugged != last_inferred_plugged
+			|| usb_plugged != last_usb_plugged
+			|| device_plugged != last_device_plugged
+			|| battery_low != last_battery_low
+			|| docked != last_docked
+			|| plug_gpio_value != last_plug_gpio_value
+			|| battery_mV_delta >= 50;
+
+		if (power_diag_changed) {
+			LOG_INF(
+				"Power diag: batt=%d mV pptt=%d valid=%d chg=%d stby=%d plug_gpio=%d inferred_plug=%d usb=%d raw_plug=%d dev_plug=%d debounce=%d settle=%d low=%d dock=%d",
+				battery_mV,
+				battery_pptt,
+				battery_pptt_valid,
+				charging,
+				charged,
+				plug_gpio_value,
+				plugged,
+				usb_plugged,
+				raw_device_plugged,
+				device_plugged,
+				plug_state_debouncing,
+				plug_signal_settling,
+				battery_low,
+				docked
+			);
+		}
+
 		sys_update_battery_tracker_voltage(battery_mV, device_plugged || plug_signal_settling);
 		if (current_battery_pptt_valid && !plug_signal_settling && (samples == BATTERY_SAMPLES || device_plugged))
 			sys_update_battery_tracker(current_battery_pptt, device_plugged);
@@ -794,17 +886,44 @@ static void power_thread(void)
 			battery_mV
 		);
 
-		if (charging)
-			set_led(SYS_LED_PATTERN_PULSE_PERSIST, SYS_LED_PRIORITY_SYSTEM);
-		else if (charged)
-			set_led(SYS_LED_PATTERN_ON_PERSIST, SYS_LED_PRIORITY_SYSTEM);
-		else if (plugged || usb_plugged)
-			set_led(SYS_LED_PATTERN_PULSE_PERSIST, SYS_LED_PRIORITY_SYSTEM);
-		else if (battery_low)
-			set_led(SYS_LED_PATTERN_LONG_PERSIST, SYS_LED_PRIORITY_SYSTEM);
-		else
-			set_led(SYS_LED_PATTERN_ACTIVE_PERSIST, SYS_LED_PRIORITY_SYSTEM);
+		enum sys_led_pattern system_led_pattern;
+		const char *system_led_reason;
+
+		if (charging) {
+			system_led_pattern = SYS_LED_PATTERN_PULSE_PERSIST;
+			system_led_reason = "charging";
+		} else if (charged) {
+			system_led_pattern = SYS_LED_PATTERN_ON_PERSIST;
+			system_led_reason = "charged";
+		} else if (plugged || usb_plugged) {
+			system_led_pattern = SYS_LED_PATTERN_PULSE_PERSIST;
+			system_led_reason = plugged ? "inferred-plugged" : "usb-plugged";
+		} else if (battery_low) {
+			system_led_pattern = SYS_LED_PATTERN_LONG_PERSIST;
+			system_led_reason = "battery-low";
+		} else {
+			system_led_pattern = SYS_LED_PATTERN_ACTIVE_PERSIST;
+			system_led_reason = "active";
+		}
+
+		if (!power_diag_valid || system_led_pattern != last_system_led_pattern) {
+			LOG_INF("Power LED decision: %s reason=%s",
+				power_led_pattern_name(system_led_pattern), system_led_reason);
+		}
+		set_led(system_led_pattern, SYS_LED_PRIORITY_SYSTEM);
 //			set_led(SYS_LED_PATTERN_OFF, SYS_LED_PRIORITY_SYSTEM);
+
+		power_diag_valid = true;
+		last_charging = charging;
+		last_charged = charged;
+		last_inferred_plugged = plugged;
+		last_usb_plugged = usb_plugged;
+		last_device_plugged = device_plugged;
+		last_battery_low = battery_low;
+		last_docked = docked;
+		last_battery_mV = battery_mV;
+		last_plug_gpio_value = plug_gpio_value;
+		last_system_led_pattern = system_led_pattern;
 
 		/* Feed watchdog at end of each loop iteration */
 		watchdog_feed(WDT_CHANNEL_POWER);
