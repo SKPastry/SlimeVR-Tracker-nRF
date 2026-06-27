@@ -170,6 +170,7 @@ static const char *led_caller_name(void)
 #ifdef LED_STRIP_EXISTS
 static struct led_rgb last_strip_pixel;
 static bool last_strip_pixel_valid;
+static bool force_next_strip_update;
 static int64_t last_strip_update_ms;
 static int64_t last_strip_error_log_ms = -1000;
 
@@ -181,9 +182,15 @@ static bool led_strip_pixel_equal(const struct led_rgb *a, const struct led_rgb 
 static int led_strip_update_checked(const struct led_rgb *pixel, bool force)
 {
 	int64_t now = k_uptime_get();
+	bool force_next = force_next_strip_update;
+	bool black = pixel->r == 0 && pixel->g == 0 && pixel->b == 0;
+	bool log_update = force || force_next || black;
+	int64_t elapsed_ms = last_strip_pixel_valid ? now - last_strip_update_ms : -1;
+	bool force_update = force || force_next_strip_update
+		|| black;
 	int ret;
 
-	if (!force && last_strip_pixel_valid) {
+	if (!force_update && last_strip_pixel_valid) {
 		if (led_strip_pixel_equal(pixel, &last_strip_pixel)) {
 			return 0;
 		}
@@ -192,8 +199,26 @@ static int led_strip_update_checked(const struct led_rgb *pixel, bool force)
 		}
 	}
 
+	if (log_update) {
+		LOG_INF(
+			"LED strip update tx: rgb=%u,%u,%u force=%d force_next=%d black=%d last_valid=%d dt=%lld",
+			pixel->r,
+			pixel->g,
+			pixel->b,
+			force,
+			force_next,
+			black,
+			last_strip_pixel_valid,
+			(long long)elapsed_ms
+		);
+	}
+
 	ret = led_strip_update_rgb(strip, (struct led_rgb *)pixel, 1);
 	if (ret < 0) {
+		if (log_update) {
+			LOG_ERR("LED strip update tx failed: rgb=%u,%u,%u ret=%d",
+				pixel->r, pixel->g, pixel->b, ret);
+		}
 		if (now - last_strip_error_log_ms >= 1000) {
 			last_strip_error_log_ms = now;
 			LOG_ERR("LED strip update failed: %d", ret);
@@ -201,9 +226,15 @@ static int led_strip_update_checked(const struct led_rgb *pixel, bool force)
 		return ret;
 	}
 
+	if (log_update) {
+		LOG_INF("LED strip update tx ok: rgb=%u,%u,%u ret=%d",
+			pixel->r, pixel->g, pixel->b, ret);
+	}
+
 	last_strip_pixel = *pixel;
 	last_strip_pixel_valid = true;
 	last_strip_update_ms = now;
+	force_next_strip_update = false;
 
 	return 0;
 }
@@ -315,6 +346,7 @@ static void led_resume(void)
 	if (!was_powered) {
 		k_usleep(LED_STRIP_POWER_ON_DELAY_US);
 		last_strip_pixel_valid = false;
+		force_next_strip_update = true;
 	}
 #endif
 #endif
@@ -488,6 +520,9 @@ void set_led(enum sys_led_pattern led_pattern, int priority)
 	current_led_pattern = led_pattern;
 	current_priority = priority;
 	led_pattern_state = 0;
+#ifdef LED_STRIP_EXISTS
+	force_next_strip_update = true;
+#endif
 	LOG_INF("LED effective: %s/%s -> %s/%s",
 		led_pattern_name(previous_effective),
 		led_priority_name(previous_effective_priority),
@@ -521,11 +556,15 @@ static void led_thread(void)
 	return;
 #else
 	while (1) {
-		LOG_DBG("led_thread: current_led_pattern %d", current_led_pattern);
-		switch (current_led_pattern) {
+		enum sys_led_pattern handled_pattern = current_led_pattern;
+
+		LOG_DBG("led_thread: current_led_pattern %d", handled_pattern);
+		switch (handled_pattern) {
 		case SYS_LED_PATTERN_ON:
 			led_pin_set(SYS_LED_COLOR_DEFAULT, 10000, 10000);
-			k_thread_suspend(led_thread_id);
+			if (current_led_pattern == handled_pattern) {
+				k_thread_suspend(led_thread_id);
+			}
 			break;
 		case SYS_LED_PATTERN_SHORT:
 			led_pattern_state = (led_pattern_state + 1) % 2;
@@ -600,7 +639,9 @@ static void led_thread(void)
 
 		case SYS_LED_PATTERN_ON_PERSIST:
 			led_pin_set(SYS_LED_COLOR_SUCCESS, 2000, 10000);
-			k_thread_suspend(led_thread_id);
+			if (current_led_pattern == handled_pattern) {
+				k_thread_suspend(led_thread_id);
+			}
 			break;
 		case SYS_LED_PATTERN_LONG_PERSIST:
 			led_pattern_state = (led_pattern_state + 1) % 2;
