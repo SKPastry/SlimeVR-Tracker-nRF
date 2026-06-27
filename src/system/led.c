@@ -200,7 +200,7 @@ static int led_strip_update_checked(const struct led_rgb *pixel, bool force)
 	}
 
 	if (log_update) {
-		LOG_INF(
+		LOG_DBG(
 			"LED strip update tx: rgb=%u,%u,%u force=%d force_next=%d black=%d last_valid=%d dt=%lld",
 			pixel->r,
 			pixel->g,
@@ -227,7 +227,7 @@ static int led_strip_update_checked(const struct led_rgb *pixel, bool force)
 	}
 
 	if (log_update) {
-		LOG_INF("LED strip update tx ok: rgb=%u,%u,%u ret=%d",
+		LOG_DBG("LED strip update tx ok: rgb=%u,%u,%u ret=%d",
 			pixel->r, pixel->g, pixel->b, ret);
 	}
 
