@@ -25,6 +25,9 @@ static const struct gpio_dt_spec led_en = GPIO_DT_SPEC_GET(ZEPHYR_USER_NODE, led
 #include <zephyr/drivers/led_strip.h>
 #define STRIP_NODE DT_ALIAS(led_strip)
 static const struct device *const strip = DEVICE_DT_GET(STRIP_NODE);
+#define LED_STRIP_POWER_ON_DELAY_US 2000
+#define LED_STRIP_POWER_OFF_DELAY_US 1000
+#define LED_STRIP_MIN_UPDATE_INTERVAL_MS 20
 #endif
 
 #if DT_NODE_HAS_PROP(ZEPHYR_USER_NODE, led_gpios)
@@ -83,6 +86,66 @@ static int current_priority;
 static enum sys_led_pattern led_patterns[SYS_LED_PATTERN_DEPTH]
 	= {[0 ...(SYS_LED_PATTERN_DEPTH - 1)] = SYS_LED_PATTERN_OFF};
 static int led_pattern_state;
+#ifdef LED_EN_EXISTS
+static bool led_powered;
+#else
+static bool led_powered = true;
+#endif
+
+#ifdef LED_STRIP_EXISTS
+static struct led_rgb last_strip_pixel;
+static bool last_strip_pixel_valid;
+static int64_t last_strip_update_ms;
+static int64_t last_strip_error_log_ms = -1000;
+
+static bool led_strip_pixel_equal(const struct led_rgb *a, const struct led_rgb *b)
+{
+	return a->r == b->r && a->g == b->g && a->b == b->b;
+}
+
+static int led_strip_update_checked(const struct led_rgb *pixel, bool force)
+{
+	int64_t now = k_uptime_get();
+	int ret;
+
+	if (!force && last_strip_pixel_valid) {
+		if (led_strip_pixel_equal(pixel, &last_strip_pixel)) {
+			return 0;
+		}
+		if (now - last_strip_update_ms < LED_STRIP_MIN_UPDATE_INTERVAL_MS) {
+			return 0;
+		}
+	}
+
+	ret = led_strip_update_rgb(strip, (struct led_rgb *)pixel, 1);
+	if (ret < 0) {
+		if (now - last_strip_error_log_ms >= 1000) {
+			last_strip_error_log_ms = now;
+			LOG_ERR("LED strip update failed: %d", ret);
+		}
+		return ret;
+	}
+
+	last_strip_pixel = *pixel;
+	last_strip_pixel_valid = true;
+	last_strip_update_ms = now;
+
+	return 0;
+}
+
+static void led_strip_force_off(void)
+{
+	static const struct led_rgb off_pixel[1] = {{0, 0, 0}};
+
+	if (!led_powered) {
+		return;
+	}
+
+	(void)led_strip_update_checked(off_pixel, true);
+	k_usleep(LED_STRIP_POWER_OFF_DELAY_US);
+	last_strip_pixel_valid = false;
+}
+#endif
 
 static int led_pin_init(void)
 {
@@ -136,6 +199,7 @@ static void led_suspend(void)
 {
 	LOG_DBG("led_suspend");
 #ifdef LED_STRIP_EXISTS
+	led_strip_force_off();
 	pm_device_action_run(strip, PM_DEVICE_ACTION_SUSPEND);
 #endif
 #ifdef PWM_LED_EXISTS
@@ -149,9 +213,10 @@ static void led_suspend(void)
 #endif
 	led_pin_reset();
 	// disable power
-#if LED_EN_EXISTS
+#ifdef LED_EN_EXISTS
 	gpio_pin_configure_dt(&led_en, GPIO_OUTPUT);
 	gpio_pin_set_dt(&led_en, 0);
+	led_powered = false;
 #endif
 }
 
@@ -159,9 +224,18 @@ static void led_resume(void)
 {
 	LOG_DBG("led_resume");
 	// enable power
-#if LED_EN_EXISTS
+#ifdef LED_EN_EXISTS
+	bool was_powered = led_powered;
+
 	gpio_pin_configure_dt(&led_en, GPIO_OUTPUT);
 	gpio_pin_set_dt(&led_en, 1);
+	led_powered = true;
+#ifdef LED_STRIP_EXISTS
+	if (!was_powered) {
+		k_usleep(LED_STRIP_POWER_ON_DELAY_US);
+		last_strip_pixel_valid = false;
+	}
+#endif
 #endif
 #ifdef LED_STRIP_EXISTS
 	pm_device_action_run(strip, PM_DEVICE_ACTION_RESUME);
@@ -263,7 +337,7 @@ static void led_pin_set(enum sys_led_color color, int brightness_pptt, int value
 	pixel[0].r = 255 * (led_pwm_period[color][0] * value_pptt / 10000) / 10000;
 	pixel[0].g = 255 * (led_pwm_period[color][1] * value_pptt / 10000) / 10000;
 	pixel[0].b = 255 * (led_pwm_period[color][2] * value_pptt / 10000) / 10000;
-	led_strip_update_rgb(strip, pixel, 1);
+	(void)led_strip_update_checked(pixel, false);
 #elif PWM_LED_EXISTS
 	value_pptt = value_pptt * brightness_pptt / 10000;
 	// only supporting color if PWM is supported
