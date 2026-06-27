@@ -433,7 +433,8 @@ static int led_pwm_period[5][1] = {
 // TODO: use computed constants for high/low brightness and color values
 static void led_pin_set(enum sys_led_color color, int brightness_pptt, int value_pptt)
 {
-	LOG_DBG("led_pin_set: color %d, brightness %d, value %d", color, brightness_pptt, value_pptt);
+	LOG_DBG("led_pin_set: color %d, brightness %d, global %d, value %d",
+		color, brightness_pptt, CONFIG_LED_GLOBAL_BRIGHTNESS_PPTT, value_pptt);
 	if (brightness_pptt < 0) {
 		brightness_pptt = 0;
 	} else if (brightness_pptt > 10000) {
@@ -447,12 +448,14 @@ static void led_pin_set(enum sys_led_color color, int brightness_pptt, int value
 #if LED_STRIP_EXISTS
 	static struct led_rgb pixel[1];
 	value_pptt = value_pptt * brightness_pptt / 10000;
+	value_pptt = value_pptt * CONFIG_LED_GLOBAL_BRIGHTNESS_PPTT / 10000;
 	pixel[0].r = 255 * (led_pwm_period[color][0] * value_pptt / 10000) / 10000;
 	pixel[0].g = 255 * (led_pwm_period[color][1] * value_pptt / 10000) / 10000;
 	pixel[0].b = 255 * (led_pwm_period[color][2] * value_pptt / 10000) / 10000;
 	(void)led_strip_update_checked(pixel, false);
 #elif PWM_LED_EXISTS
 	value_pptt = value_pptt * brightness_pptt / 10000;
+	value_pptt = value_pptt * CONFIG_LED_GLOBAL_BRIGHTNESS_PPTT / 10000;
 	// only supporting color if PWM is supported
 	pwm_set_pulse_dt(&pwm_led, pwm_led.period / 10000 * (led_pwm_period[color][0] * value_pptt / 10000));
 #if PWM_LED1_EXISTS

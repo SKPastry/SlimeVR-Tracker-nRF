@@ -50,6 +50,14 @@ config LED_TRI_COLOR
 
 endchoice
 
+config LED_GLOBAL_BRIGHTNESS_PPTT
+    int "Global LED brightness (pptt)"
+    range 0 10000
+    default 10000
+    help
+        Scale LED output brightness in parts per ten-thousand.
+        10000 is full brightness, 2500 is 25%.
+
 menu "Status LED default status color"
     depends on LED_RGB_COLOR
 
