@@ -5,6 +5,7 @@
 #include "battery_tracker.h"
 #include "connection/connection.h"
 #include "system.h"
+#include "heater.h"
 #include "led.h"
 #include "connection/esb.h"
 #include "system/esb_ota.h"
@@ -229,6 +230,7 @@ static void configure_system_off(void)
 		LOG_WRN("Entering new power state while sensor error is raised");
 	if (get_status(SYS_STATUS_SYSTEM_ERROR))
 		LOG_WRN("Entering new power state while system error is raised");
+	heater_force_off();
 	clock_pre_shutdown();
 	main_imu_suspend();
 	sensor_shutdown();

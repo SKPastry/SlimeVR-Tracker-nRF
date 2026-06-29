@@ -22,12 +22,15 @@
 */
 #include "globals.h"
 #include "sensor.h"
+#include "system/heater.h"
 #include "system/system.h"
 #include "system/watchdog.h"
 #include "util.h"
 
+#include <errno.h>
 #include <math.h>
 #include <stdlib.h>
+#include <string.h>
 
 #if CONFIG_CMSIS_DSP
 #include <arm_math.h>
@@ -386,6 +389,80 @@ static float last_gyro_tcal_offset[3] = {0.0f, 0.0f, 0.0f};
 
 static void update_tcal_state(void); // Function to refresh T-Cal state
 
+static bool tcal_save_defer_nvs = false;
+static bool tcal_save_deferred_dirty = false;
+
+#if CONFIG_SENSOR_TCAL_HEATED
+typedef enum {
+	TCAL_HEATED_STATE_IDLE = 0,
+	TCAL_HEATED_STATE_RAMP,
+	TCAL_HEATED_STATE_HOLD,
+	TCAL_HEATED_STATE_MOTION_HOLD,
+	TCAL_HEATED_STATE_OPEN_LOOP,
+	TCAL_HEATED_STATE_STOPPED,
+} tcal_heated_state_t;
+
+typedef enum {
+	TCAL_HEATED_STOP_NONE = 0,
+	TCAL_HEATED_STOP_COMPLETE,
+	TCAL_HEATED_STOP_USER,
+	TCAL_HEATED_STOP_TIMEOUT,
+	TCAL_HEATED_STOP_POWER_LOST,
+	TCAL_HEATED_STOP_IMU_POWER_OFF,
+	TCAL_HEATED_STOP_TEMP_STALE,
+	TCAL_HEATED_STOP_OVERTEMP,
+	TCAL_HEATED_STOP_RISE_FAST,
+	TCAL_HEATED_STOP_HEATER_ERROR,
+	TCAL_HEATED_STOP_START_FAILED,
+} tcal_heated_stop_reason_t;
+
+typedef struct {
+	bool valid;
+	float temp;
+	float bias[3];
+	uint16_t updates;
+} tcal_heated_staged_point_t;
+
+static struct {
+	bool active;
+	bool previous_auto_enabled;
+	bool sampling_enabled;
+	tcal_heated_state_t state;
+	tcal_heated_stop_reason_t stop_reason;
+	float target_temp;
+	float setpoint_temp;
+	float ambient_temp;
+	float kp;
+	float ki;
+	float kff;
+	float integral;
+	float last_temp;
+	float last_error;
+	float last_p_out;
+	float last_i_out;
+	float last_ff_out;
+	uint16_t duty_pptt;
+	int64_t start_time;
+	int64_t last_control_time;
+	int64_t stable_start_time;
+	int64_t rest_start_time;
+	uint16_t staged_count;
+} tcal_heated = {
+	.state = TCAL_HEATED_STATE_IDLE,
+};
+
+static bool tcal_heated_tuning_initialized;
+static tcal_heated_staged_point_t tcal_heated_stage[TCAL_BUFFER_SIZE];
+
+static void tcal_heated_stage_reset(void);
+static void tcal_heated_stage_commit(void);
+static void tcal_heated_stage_point(int idx, const float bias[3]);
+static bool tcal_heated_collect_to_stage(void);
+static bool tcal_heated_should_accumulate(void);
+#else
+static bool tcal_heated_should_accumulate(void) { return true; }
+#endif
+
 // =============================================================================
 // T-Cal Moving Least Squares (MLS) Implementation
 // =============================================================================
@@ -651,7 +728,7 @@ void sensor_calibration_process_gyro(float g[3])
 	// Feed raw gyro data into continuous bucket accumulator for auto T-Cal
 	// This must happen before bias subtraction so we capture the true raw bias
 	// (auto-cal collection continues regardless of compensation enable state)
-	if (tcal_auto_calibration_enabled && !isnan(temp)) {
+	if (tcal_auto_calibration_enabled && !isnan(temp) && tcal_heated_should_accumulate()) {
 		sensor_tcal_feed_continuous_sample(g, temp);
 	}
 
@@ -3890,8 +3967,13 @@ static void tcal_save_point(int idx, const float bias[3])
 	        (double)max_delta);
 
 	if (is_new_point || max_delta >= TCAL_SAVE_SIGNIFICANCE_THRESHOLD) {
-		// Significant change or first write: persist to NVS and rebuild LUT
-		update_tcal_state();
+		if (tcal_save_defer_nvs) {
+			tcal_save_deferred_dirty = true;
+			sensor_tcal_cache_invalidate();
+		} else {
+			// Significant change or first write: persist to NVS and rebuild LUT
+			update_tcal_state();
+		}
 	} else {
 		// Minor update: refresh LUT cache so runtime lookup sees the new value
 		// without paying the cost of a full NVS write cycle
@@ -3900,6 +3982,194 @@ static void tcal_save_point(int idx, const float bias[3])
 		sensor_tcal_cache_invalidate();
 	}
 }
+
+#if CONFIG_SENSOR_TCAL_HEATED
+static const char *tcal_heated_state_name(tcal_heated_state_t state)
+{
+	switch (state) {
+	case TCAL_HEATED_STATE_IDLE: return "idle";
+	case TCAL_HEATED_STATE_RAMP: return "ramp";
+	case TCAL_HEATED_STATE_HOLD: return "hold";
+	case TCAL_HEATED_STATE_MOTION_HOLD: return "motion_hold";
+	case TCAL_HEATED_STATE_OPEN_LOOP: return "open_loop";
+	case TCAL_HEATED_STATE_STOPPED: return "stopped";
+	default: return "unknown";
+	}
+}
+
+static const char *tcal_heated_stop_reason_name(tcal_heated_stop_reason_t reason)
+{
+	switch (reason) {
+	case TCAL_HEATED_STOP_NONE: return "none";
+	case TCAL_HEATED_STOP_COMPLETE: return "complete";
+	case TCAL_HEATED_STOP_USER: return "user";
+	case TCAL_HEATED_STOP_TIMEOUT: return "timeout";
+	case TCAL_HEATED_STOP_POWER_LOST: return "power_lost";
+	case TCAL_HEATED_STOP_IMU_POWER_OFF: return "imu_power_off";
+	case TCAL_HEATED_STOP_TEMP_STALE: return "temp_stale";
+	case TCAL_HEATED_STOP_OVERTEMP: return "overtemp";
+	case TCAL_HEATED_STOP_RISE_FAST: return "rise_fast";
+	case TCAL_HEATED_STOP_HEATER_ERROR: return "heater_error";
+	case TCAL_HEATED_STOP_START_FAILED: return "start_failed";
+	default: return "unknown";
+	}
+}
+
+static void tcal_heated_update_led(void)
+{
+	if (!tcal_heated.active) {
+		return;
+	}
+
+	switch (tcal_heated.state) {
+	case TCAL_HEATED_STATE_RAMP:
+		set_led_color(SYS_LED_PATTERN_BREATH_SLOW, SYS_LED_COLOR_CALIBRATION, SYS_LED_PRIORITY_SENSOR);
+		break;
+	case TCAL_HEATED_STATE_HOLD:
+		set_led_color(
+			SYS_LED_PATTERN_BREATH_FAST,
+			tcal_heated.stable_start_time > 0 ? SYS_LED_COLOR_CALIBRATION_STABLE : SYS_LED_COLOR_CALIBRATION,
+			SYS_LED_PRIORITY_SENSOR
+		);
+		break;
+	case TCAL_HEATED_STATE_MOTION_HOLD:
+		set_led_color(SYS_LED_PATTERN_ERROR_A, SYS_LED_COLOR_CALIBRATION, SYS_LED_PRIORITY_SENSOR);
+		break;
+	case TCAL_HEATED_STATE_OPEN_LOOP:
+		set_led_color(SYS_LED_PATTERN_BREATH_SLOW, SYS_LED_COLOR_DEBUG, SYS_LED_PRIORITY_SENSOR);
+		break;
+	case TCAL_HEATED_STATE_IDLE:
+	case TCAL_HEATED_STATE_STOPPED:
+	default:
+		break;
+	}
+}
+
+static void tcal_heated_signal_stop_led(tcal_heated_stop_reason_t reason)
+{
+	switch (reason) {
+	case TCAL_HEATED_STOP_COMPLETE:
+		set_led_color(SYS_LED_PATTERN_ONESHOT_COMPLETE, SYS_LED_COLOR_SUCCESS, SYS_LED_PRIORITY_SENSOR);
+		break;
+	case TCAL_HEATED_STOP_USER:
+	case TCAL_HEATED_STOP_TIMEOUT:
+		set_led_color(SYS_LED_PATTERN_ONESHOT_PROGRESS, SYS_LED_COLOR_SUCCESS, SYS_LED_PRIORITY_SENSOR);
+		break;
+	case TCAL_HEATED_STOP_NONE:
+		break;
+	default:
+		set_led_color(SYS_LED_PATTERN_ONESHOT_ERROR, SYS_LED_COLOR_ERROR, SYS_LED_PRIORITY_SENSOR);
+		break;
+	}
+}
+
+static void tcal_heated_init_tuning(void)
+{
+	if (tcal_heated_tuning_initialized) {
+		return;
+	}
+
+	tcal_heated.kp = (float)CONFIG_SENSOR_TCAL_HEATED_DEFAULT_KP;
+	tcal_heated.ki = (float)CONFIG_SENSOR_TCAL_HEATED_DEFAULT_KI;
+	tcal_heated.kff = (float)CONFIG_SENSOR_TCAL_HEATED_DEFAULT_KFF;
+	tcal_heated_tuning_initialized = true;
+}
+
+static bool tcal_heated_external_power_ok(void)
+{
+#if CONFIG_SENSOR_TCAL_HEATED_REQUIRE_PLUGGED
+	return get_status(SYS_STATUS_PLUGGED) || vbus_read();
+#else
+	return true;
+#endif
+}
+
+static bool tcal_heated_collect_to_stage(void)
+{
+	return tcal_heated.active &&
+	       tcal_heated.state != TCAL_HEATED_STATE_OPEN_LOOP;
+}
+
+static bool tcal_heated_should_accumulate(void)
+{
+	if (tcal_heated.active && tcal_heated.state == TCAL_HEATED_STATE_OPEN_LOOP) {
+		return false;
+	}
+
+	if (!tcal_heated_collect_to_stage()) {
+		return true;
+	}
+
+	return tcal_heated.sampling_enabled;
+}
+
+static void tcal_heated_stage_reset(void)
+{
+	memset(tcal_heated_stage, 0, sizeof(tcal_heated_stage));
+	tcal_heated.staged_count = 0;
+}
+
+static void tcal_heated_stage_point(int idx, const float bias[3])
+{
+	if (idx < 0 || idx >= TCAL_BUFFER_SIZE) {
+		return;
+	}
+
+	float bucket_temp = IDX_TO_TEMP(idx) + (0.5f / CONFIG_SENSOR_POLY_STEPS_PER_DEGREE);
+	tcal_heated_staged_point_t *point = &tcal_heated_stage[idx];
+
+	if (!point->valid) {
+		point->valid = true;
+		point->temp = bucket_temp;
+		memcpy(point->bias, bias, sizeof(point->bias));
+		point->updates = 1;
+		tcal_heated.staged_count++;
+	} else {
+		for (int axis = 0; axis < 3; axis++) {
+			point->bias[axis] = TCAL_HYSTERESIS_EMA_RISING * bias[axis] +
+				(1.0f - TCAL_HYSTERESIS_EMA_RISING) * point->bias[axis];
+		}
+		point->updates++;
+	}
+
+	LOG_INF(
+		"Heated T-Cal: staged idx %d (%.2fC), updates %u, bias [%.5f, %.5f, %.5f]",
+		idx,
+		(double)bucket_temp,
+		point->updates,
+		(double)point->bias[0],
+		(double)point->bias[1],
+		(double)point->bias[2]
+	);
+}
+
+static void tcal_heated_stage_commit(void)
+{
+	if (tcal_heated.staged_count == 0) {
+		return;
+	}
+
+	LOG_INF("Heated T-Cal: committing %u staged point(s)", tcal_heated.staged_count);
+	tcal_save_defer_nvs = true;
+	tcal_save_deferred_dirty = false;
+
+	for (int idx = 0; idx < TCAL_BUFFER_SIZE; idx++) {
+		if (tcal_heated_stage[idx].valid) {
+			tcal_save_point(idx, tcal_heated_stage[idx].bias);
+		}
+	}
+
+	tcal_save_defer_nvs = false;
+
+	if (tcal_save_deferred_dirty) {
+		update_tcal_state();
+	} else {
+		sensor_tcal_cache_invalidate();
+	}
+	tcal_save_deferred_dirty = false;
+	tcal_heated_stage_reset();
+}
+#endif
 
 /**
  * Flush the accumulator: compute average bias/temperature, save to the
@@ -3939,6 +4209,15 @@ static void tcal_accum_flush(void)
 	LOG_INF("T-Cal: Flushing accumulator: %d samples, avg temp %.2fC (range %.2fC), bucket idx %d",
 	        tcal_accum.sample_count, (double)avg_temp,
 	        (double)(tcal_accum.temp_max - tcal_accum.temp_min), idx);
+
+#if CONFIG_SENSOR_TCAL_HEATED
+	if (tcal_heated_collect_to_stage()) {
+		tcal_heated_stage_point(idx, avg_bias);
+		tcal_accum_last_commit_time = k_uptime_get();
+		tcal_accum_reset();
+		return;
+	}
+#endif
 
 	// Update gyroTemp in retained
 	sys_write(MAIN_GYRO_TEMP_ID, &retained->gyroTemp, &avg_temp, sizeof(avg_temp));
@@ -4036,6 +4315,12 @@ void sensor_tcal_feed_continuous_sample(const float g[3], float temp)
  */
 void sensor_tcal_continuous_motion_detected(void)
 {
+#if CONFIG_SENSOR_TCAL_HEATED
+	if (tcal_heated_collect_to_stage()) {
+		tcal_accum_reset();
+		return;
+	}
+#endif
 	if (tcal_accum.active) {
 		if (tcal_accum.sample_count >= TCAL_ACCUM_MIN_SAMPLES) {
 			tcal_accum_flush();
@@ -4044,6 +4329,460 @@ void sensor_tcal_continuous_motion_detected(void)
 		}
 	}
 }
+
+#if CONFIG_SENSOR_TCAL_HEATED
+bool sensor_tcal_heated_is_active(void)
+{
+	return tcal_heated.active;
+}
+
+static int tcal_heated_validate_start(float *current_temp)
+{
+	if (!heater_is_available()) {
+		return -ENODEV;
+	}
+
+	if (!sensor_is_initialized()) {
+		return -EAGAIN;
+	}
+
+	if (!tcal_heated_external_power_ok()) {
+		return -EPERM;
+	}
+
+	if (!heater_imu_powered()) {
+		return -EIO;
+	}
+
+	if (sensor_get_current_imu_temperature_checked(current_temp, 2000) != 0) {
+		return -ETIMEDOUT;
+	}
+
+	if (sensor_calibration_request(0) != 0) {
+		return -EBUSY;
+	}
+
+	return 0;
+}
+
+static void tcal_heated_stop_internal(tcal_heated_stop_reason_t reason, bool commit_staged)
+{
+	bool was_active = tcal_heated.active;
+	bool was_collecting = was_active && tcal_heated.state != TCAL_HEATED_STATE_OPEN_LOOP;
+	bool previous_auto = tcal_heated.previous_auto_enabled;
+
+	heater_force_off();
+	tcal_heated.duty_pptt = 0;
+
+	if (was_collecting) {
+		if (commit_staged) {
+			tcal_accum_flush();
+			tcal_heated_stage_commit();
+		} else {
+			tcal_accum_reset();
+			tcal_heated_stage_reset();
+		}
+	}
+
+	if (was_active) {
+		if (!(reason == TCAL_HEATED_STOP_USER && !commit_staged)) {
+			tcal_heated_signal_stop_led(reason);
+		}
+		sensor_tcal_set_auto_calibration(previous_auto);
+	}
+
+	tcal_heated.active = false;
+	tcal_heated.sampling_enabled = false;
+	tcal_heated.state = TCAL_HEATED_STATE_STOPPED;
+	tcal_heated.stop_reason = reason;
+	tcal_heated.stable_start_time = 0;
+	tcal_heated.rest_start_time = 0;
+
+	LOG_INF(
+		"Heated T-Cal stopped: %s, staged data %s",
+		tcal_heated_stop_reason_name(reason),
+		commit_staged ? "committed" : "discarded"
+	);
+}
+
+int sensor_tcal_heated_start(float target_temp)
+{
+	tcal_heated_init_tuning();
+
+	if (tcal_heated.active) {
+		return -EBUSY;
+	}
+
+	if (isnan(target_temp)) {
+		target_temp = (float)CONFIG_SENSOR_TCAL_HEATED_DEFAULT_TARGET_C;
+	}
+
+	if (target_temp < (float)CONFIG_SENSOR_POLY_TEMP_MIN ||
+	    target_temp > (float)CONFIG_SENSOR_POLY_TEMP_MAX ||
+	    target_temp > (float)CONFIG_SENSOR_TCAL_HEATED_MAX_TEMP_C) {
+		tcal_heated.stop_reason = TCAL_HEATED_STOP_START_FAILED;
+		tcal_heated_signal_stop_led(TCAL_HEATED_STOP_START_FAILED);
+		return -ERANGE;
+	}
+
+	float current_temp = NAN;
+	int err = tcal_heated_validate_start(&current_temp);
+	if (err) {
+		tcal_heated.stop_reason = TCAL_HEATED_STOP_START_FAILED;
+		tcal_heated_signal_stop_led(TCAL_HEATED_STOP_START_FAILED);
+		return err;
+	}
+
+	tcal_heated_stage_reset();
+	tcal_accum_reset();
+
+	tcal_heated.previous_auto_enabled = sensor_tcal_get_auto_calibration();
+	sensor_tcal_set_auto_calibration(true);
+
+	int64_t now = k_uptime_get();
+	tcal_heated.active = true;
+	tcal_heated.sampling_enabled = true;
+	tcal_heated.state = TCAL_HEATED_STATE_RAMP;
+	tcal_heated.stop_reason = TCAL_HEATED_STOP_NONE;
+	tcal_heated.target_temp = target_temp;
+	tcal_heated.setpoint_temp = current_temp;
+	tcal_heated.ambient_temp = current_temp;
+	tcal_heated.integral = 0.0f;
+	tcal_heated.last_temp = current_temp;
+	tcal_heated.last_error = 0.0f;
+	tcal_heated.last_p_out = 0.0f;
+	tcal_heated.last_i_out = 0.0f;
+	tcal_heated.last_ff_out = 0.0f;
+	tcal_heated.duty_pptt = 0;
+	tcal_heated.start_time = now;
+	tcal_heated.last_control_time = now;
+	tcal_heated.stable_start_time = 0;
+	tcal_heated.rest_start_time = now;
+
+	LOG_INF(
+		"Heated T-Cal started: current %.2fC, target %.2fC, Kp %.2f, Ki %.2f, Kff %.2f",
+		(double)current_temp,
+		(double)target_temp,
+		(double)tcal_heated.kp,
+		(double)tcal_heated.ki,
+		(double)tcal_heated.kff
+	);
+	tcal_heated_update_led();
+	return 0;
+}
+
+void sensor_tcal_heated_stop(void)
+{
+	tcal_heated_stop_internal(TCAL_HEATED_STOP_USER, true);
+}
+
+void sensor_tcal_heated_abort(void)
+{
+	tcal_heated_stop_internal(TCAL_HEATED_STOP_USER, false);
+}
+
+int sensor_tcal_heated_set_open_loop_duty(uint16_t duty_pptt)
+{
+	tcal_heated_init_tuning();
+
+	if (tcal_heated.active && tcal_heated.state != TCAL_HEATED_STATE_OPEN_LOOP) {
+		return -EBUSY;
+	}
+
+	float current_temp = NAN;
+	int err = tcal_heated_validate_start(&current_temp);
+	if (err) {
+		tcal_heated.stop_reason = TCAL_HEATED_STOP_START_FAILED;
+		tcal_heated_signal_stop_led(TCAL_HEATED_STOP_START_FAILED);
+		return err;
+	}
+
+	err = heater_set_duty_pptt(duty_pptt);
+	if (err) {
+		tcal_heated.stop_reason = TCAL_HEATED_STOP_HEATER_ERROR;
+		tcal_heated_signal_stop_led(TCAL_HEATED_STOP_HEATER_ERROR);
+		return err;
+	}
+
+	int64_t now = k_uptime_get();
+	if (!tcal_heated.active) {
+		tcal_heated.previous_auto_enabled = sensor_tcal_get_auto_calibration();
+		set_status(SYS_STATUS_CALIBRATION_RUNNING, true);
+		tcal_heated.start_time = now;
+	}
+
+	tcal_heated.active = true;
+	tcal_heated.sampling_enabled = false;
+	tcal_heated.state = TCAL_HEATED_STATE_OPEN_LOOP;
+	tcal_heated.stop_reason = TCAL_HEATED_STOP_NONE;
+	tcal_heated.target_temp = current_temp;
+	tcal_heated.setpoint_temp = current_temp;
+	tcal_heated.ambient_temp = current_temp;
+	tcal_heated.last_temp = current_temp;
+	tcal_heated.last_control_time = now;
+	tcal_heated.duty_pptt = MIN(duty_pptt, CONFIG_SYSTEM_IMU_HEATER_MAX_DUTY_PPTT);
+	tcal_heated_update_led();
+	return 0;
+}
+
+int sensor_tcal_heated_tune(const char *param, float value)
+{
+	tcal_heated_init_tuning();
+
+	if (!param || isnan(value) || value < 0.0f) {
+		return -EINVAL;
+	}
+
+	if (strcmp(param, "kp") == 0) {
+		tcal_heated.kp = value;
+	} else if (strcmp(param, "ki") == 0) {
+		tcal_heated.ki = value;
+	} else if (strcmp(param, "kff") == 0) {
+		tcal_heated.kff = value;
+	} else {
+		return -EINVAL;
+	}
+
+	LOG_INF("Heated T-Cal tune: %s = %.4f", param, (double)value);
+	return 0;
+}
+
+static int tcal_heated_apply_duty(float duty_raw, float dt_s)
+{
+	float duty = duty_raw;
+	if (duty < 0.0f) {
+		duty = 0.0f;
+	} else if (duty > (float)CONFIG_SYSTEM_IMU_HEATER_MAX_DUTY_PPTT) {
+		duty = (float)CONFIG_SYSTEM_IMU_HEATER_MAX_DUTY_PPTT;
+	}
+
+	float slew = (float)CONFIG_SENSOR_TCAL_HEATED_SLEW_PPTT_PER_S * dt_s;
+	if (slew < 1.0f) {
+		slew = 1.0f;
+	}
+
+	float current = (float)tcal_heated.duty_pptt;
+	if (duty > current + slew) {
+		duty = current + slew;
+	} else if (duty < current - slew) {
+		duty = current - slew;
+	}
+
+	uint16_t duty_pptt = (uint16_t)(duty + 0.5f);
+	int err = heater_set_duty_pptt(duty_pptt);
+	if (err) {
+		tcal_heated_stop_internal(TCAL_HEATED_STOP_HEATER_ERROR, false);
+		return err;
+	}
+
+	tcal_heated.duty_pptt = duty_pptt;
+	return 0;
+}
+
+void sensor_tcal_heated_update(bool is_resting)
+{
+	if (!tcal_heated.active) {
+		return;
+	}
+
+	int64_t now = k_uptime_get();
+
+	if (!tcal_heated_external_power_ok()) {
+		tcal_heated_stop_internal(TCAL_HEATED_STOP_POWER_LOST, false);
+		return;
+	}
+
+	if (!heater_imu_powered()) {
+		tcal_heated_stop_internal(TCAL_HEATED_STOP_IMU_POWER_OFF, false);
+		return;
+	}
+
+	float current_temp = NAN;
+	if (sensor_get_current_imu_temperature_checked(&current_temp, 2000) != 0) {
+		tcal_heated_stop_internal(TCAL_HEATED_STOP_TEMP_STALE, false);
+		return;
+	}
+
+	float overtemp_limit = MIN(
+		tcal_heated.target_temp + 2.0f,
+		(float)CONFIG_SENSOR_TCAL_HEATED_MAX_TEMP_C
+	);
+	if (current_temp > overtemp_limit) {
+		tcal_heated_stop_internal(TCAL_HEATED_STOP_OVERTEMP, false);
+		return;
+	}
+
+	int64_t total_elapsed = now - tcal_heated.start_time;
+	if (total_elapsed > (int64_t)CONFIG_SENSOR_TCAL_HEATED_TIMEOUT_MIN * 60 * 1000) {
+		tcal_heated_stop_internal(TCAL_HEATED_STOP_TIMEOUT, true);
+		return;
+	}
+
+	if (tcal_heated.state != TCAL_HEATED_STATE_OPEN_LOOP) {
+		if (!is_resting) {
+			tcal_heated.sampling_enabled = false;
+			tcal_heated.state = TCAL_HEATED_STATE_MOTION_HOLD;
+			tcal_heated.rest_start_time = 0;
+			tcal_heated.stable_start_time = 0;
+		} else if (tcal_heated.state == TCAL_HEATED_STATE_MOTION_HOLD) {
+			if (tcal_heated.rest_start_time == 0) {
+				tcal_heated.rest_start_time = now;
+			}
+			if (now - tcal_heated.rest_start_time >= CONFIG_SENSOR_TCAL_HEATED_RESUME_STABLE_MS) {
+				tcal_heated.sampling_enabled = true;
+				tcal_heated.state = (tcal_heated.setpoint_temp >= tcal_heated.target_temp) ?
+					TCAL_HEATED_STATE_HOLD : TCAL_HEATED_STATE_RAMP;
+			} else {
+				tcal_heated.sampling_enabled = false;
+			}
+		} else {
+			tcal_heated.sampling_enabled = true;
+			tcal_heated.rest_start_time = now;
+		}
+	}
+
+	tcal_heated_update_led();
+
+	int64_t dt_ms = now - tcal_heated.last_control_time;
+	if (dt_ms < 1000) {
+		return;
+	}
+
+	float dt_s = (float)dt_ms / 1000.0f;
+	if (dt_s <= 0.0f) {
+		dt_s = 1.0f;
+	}
+
+	float rise_mcps = (current_temp - tcal_heated.last_temp) * 1000.0f / dt_s;
+	if (rise_mcps > (float)CONFIG_SENSOR_TCAL_HEATED_MAX_RISE_MCPS) {
+		tcal_heated_stop_internal(TCAL_HEATED_STOP_RISE_FAST, false);
+		return;
+	}
+
+	if (tcal_heated.state == TCAL_HEATED_STATE_OPEN_LOOP) {
+		tcal_heated.last_control_time = now;
+		tcal_heated.last_temp = current_temp;
+		return;
+	}
+
+	if (tcal_heated.state == TCAL_HEATED_STATE_RAMP) {
+		tcal_heated.setpoint_temp +=
+			((float)CONFIG_SENSOR_TCAL_HEATED_RAMP_MCPS / 1000.0f) * dt_s;
+		if (tcal_heated.setpoint_temp >= tcal_heated.target_temp) {
+			tcal_heated.setpoint_temp = tcal_heated.target_temp;
+			tcal_heated.state = TCAL_HEATED_STATE_HOLD;
+		}
+	}
+
+	float band = (float)CONFIG_SENSOR_TCAL_HEATED_STABLE_BAND_MC / 1000.0f;
+	if (tcal_heated.state == TCAL_HEATED_STATE_HOLD &&
+	    fabsf(current_temp - tcal_heated.target_temp) <= band) {
+		if (tcal_heated.stable_start_time == 0) {
+			tcal_heated.stable_start_time = now;
+		} else if (now - tcal_heated.stable_start_time >= CONFIG_SENSOR_TCAL_HEATED_STABLE_MS) {
+			tcal_heated_stop_internal(TCAL_HEATED_STOP_COMPLETE, true);
+			return;
+		}
+	} else {
+		tcal_heated.stable_start_time = 0;
+	}
+
+	tcal_heated_update_led();
+
+	float error = tcal_heated.setpoint_temp - current_temp;
+	float ff_out = tcal_heated.kff * MAX(tcal_heated.setpoint_temp - tcal_heated.ambient_temp, 0.0f);
+	float p_out = tcal_heated.kp * error;
+	float current_i_out = tcal_heated.ki * tcal_heated.integral;
+	float unclamped_current = ff_out + p_out + current_i_out;
+	bool saturated_high = unclamped_current >= (float)CONFIG_SYSTEM_IMU_HEATER_MAX_DUTY_PPTT && error > 0.0f;
+	bool saturated_low = unclamped_current <= 0.0f && error < 0.0f;
+
+	if (!saturated_high && !saturated_low) {
+		tcal_heated.integral += error * dt_s;
+		if (tcal_heated.ki > 0.0f) {
+			float i_limit = ((float)CONFIG_SYSTEM_IMU_HEATER_MAX_DUTY_PPTT * 0.3f) / tcal_heated.ki;
+			if (tcal_heated.integral > i_limit) {
+				tcal_heated.integral = i_limit;
+			} else if (tcal_heated.integral < -i_limit) {
+				tcal_heated.integral = -i_limit;
+			}
+		}
+	}
+
+	float i_out = tcal_heated.ki * tcal_heated.integral;
+	float duty_raw = ff_out + p_out + i_out;
+	(void)tcal_heated_apply_duty(duty_raw, dt_s);
+
+	tcal_heated.last_error = error;
+	tcal_heated.last_p_out = p_out;
+	tcal_heated.last_i_out = i_out;
+	tcal_heated.last_ff_out = ff_out;
+	tcal_heated.last_temp = current_temp;
+	tcal_heated.last_control_time = now;
+
+#if CONFIG_SENSOR_TCAL_HEATED_DEBUG_LOG
+	printk(
+		"%lld,%.3f,%.3f,%.3f,%.2f,%.2f,%.2f,%u,%s\n",
+		now,
+		(double)current_temp,
+		(double)tcal_heated.setpoint_temp,
+		(double)error,
+		(double)p_out,
+		(double)i_out,
+		(double)ff_out,
+		tcal_heated.duty_pptt,
+		tcal_heated_state_name(tcal_heated.state)
+	);
+#endif
+}
+
+void sensor_tcal_heated_status(void)
+{
+	tcal_heated_init_tuning();
+
+	float current_temp = NAN;
+	int temp_err = sensor_get_current_imu_temperature_checked(&current_temp, 2000);
+	struct heater_status heater_status;
+	heater_get_status(&heater_status);
+
+	printk("Heated T-Cal Status:\n");
+	printk("  State: %s\n", tcal_heated_state_name(tcal_heated.state));
+	printk("  Active: %s\n", tcal_heated.active ? "yes" : "no");
+	printk("  Stop reason: %s\n", tcal_heated_stop_reason_name(tcal_heated.stop_reason));
+	printk("  Heater available: %s, PWM ready: %s, IMU powered: %s\n",
+		heater_status.available ? "yes" : "no",
+		heater_status.pwm_ready ? "yes" : "no",
+		heater_status.imu_powered ? "yes" : "no");
+	if (temp_err == 0) {
+		printk("  Current temp: %.2fC\n", (double)current_temp);
+	} else {
+		printk("  Current temp: stale/unavailable (%d)\n", temp_err);
+	}
+	printk("  Target: %.2fC, setpoint: %.2fC\n",
+		(double)tcal_heated.target_temp,
+		(double)tcal_heated.setpoint_temp);
+	printk("  Duty: %u / %u pptt\n", heater_status.duty_pptt, heater_status.max_duty_pptt);
+	printk("  Kp: %.4f, Ki: %.4f, Kff: %.4f\n",
+		(double)tcal_heated.kp,
+		(double)tcal_heated.ki,
+		(double)tcal_heated.kff);
+	printk("  Last P/I/FF: %.2f / %.2f / %.2f pptt\n",
+		(double)tcal_heated.last_p_out,
+		(double)tcal_heated.last_i_out,
+		(double)tcal_heated.last_ff_out);
+	printk("  Sampling: %s, staged buckets: %u\n",
+		tcal_heated.sampling_enabled ? "enabled" : "paused",
+		tcal_heated.staged_count);
+	if (tcal_heated.active) {
+		printk("  Runtime: %lld ms\n", k_uptime_get() - tcal_heated.start_time);
+		if (tcal_heated.stable_start_time > 0) {
+			printk("  Stable for: %lld ms / %d ms\n",
+				k_uptime_get() - tcal_heated.stable_start_time,
+				CONFIG_SENSOR_TCAL_HEATED_STABLE_MS);
+		}
+	}
+}
+#endif
 
 // Check and request auto calibration if conditions are met.
 // With continuous accumulator sampling, this is only used as a fallback
@@ -4057,6 +4796,12 @@ void sensor_tcal_check_auto_calibration(float current_temp)
 	if (!tcal_auto_calibration_enabled) {
 		return;
 	}
+
+#if CONFIG_SENSOR_TCAL_HEATED
+	if (tcal_heated.active) {
+		return;
+	}
+#endif
 
 	// Continuous accumulator handles the normal case.
 	// This fallback only triggers initial manual calibration when there

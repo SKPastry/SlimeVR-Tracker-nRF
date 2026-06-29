@@ -23,6 +23,9 @@
 #ifndef SLIMENRF_SENSOR_CALIBRATION
 #define SLIMENRF_SENSOR_CALIBRATION
 
+#include <stdbool.h>
+#include <stdint.h>
+
 /* Sensor feeds data to calibration */
 void sensor_calibration_process_accel(float a[3]);
 void sensor_calibration_process_gyro(float g[3]);
@@ -89,6 +92,17 @@ bool sensor_tcal_get_enabled(void);
 // Continuous bucket-based T-Cal sampling
 void sensor_tcal_feed_continuous_sample(const float g[3], float temp);
 void sensor_tcal_continuous_motion_detected(void);
+
+#if CONFIG_SENSOR_TCAL_HEATED
+bool sensor_tcal_heated_is_active(void);
+int sensor_tcal_heated_start(float target_temp);
+void sensor_tcal_heated_stop(void);
+void sensor_tcal_heated_abort(void);
+void sensor_tcal_heated_update(bool is_resting);
+void sensor_tcal_heated_status(void);
+int sensor_tcal_heated_tune(const char *param, float value);
+int sensor_tcal_heated_set_open_loop_duty(uint16_t duty_pptt);
+#endif
 
 // Quality assessment function - returns true if quality is sufficient
 bool sensor_tcal_assess_quality(float current_temp, tcal_quality_t *quality);

@@ -83,8 +83,16 @@ static enum sys_led_pattern current_led_pattern;
 static int current_priority;
 
 #if LED_EXISTS || LED_STRIP_EXISTS
-static enum sys_led_pattern led_patterns[SYS_LED_PATTERN_DEPTH]
-	= {[0 ...(SYS_LED_PATTERN_DEPTH - 1)] = SYS_LED_PATTERN_OFF};
+struct led_slot {
+	enum sys_led_pattern pattern;
+	enum sys_led_color color;
+	bool has_color;
+};
+
+static struct led_slot led_slots[SYS_LED_PATTERN_DEPTH]
+	= {[0 ...(SYS_LED_PATTERN_DEPTH - 1)] = {SYS_LED_PATTERN_OFF, SYS_LED_COLOR_DEFAULT, false}};
+static enum sys_led_color current_led_color;
+static bool current_led_has_color;
 static int led_pattern_state;
 #ifdef LED_EN_EXISTS
 static bool led_powered;
@@ -107,6 +115,10 @@ static const char *led_pattern_name(enum sys_led_pattern pattern)
 		return "LONG";
 	case SYS_LED_PATTERN_FLASH:
 		return "FLASH";
+	case SYS_LED_PATTERN_BREATH_SLOW:
+		return "BREATH_SLOW";
+	case SYS_LED_PATTERN_BREATH_FAST:
+		return "BREATH_FAST";
 	case SYS_LED_PATTERN_ONESHOT_POWERON:
 		return "ONESHOT_POWERON";
 	case SYS_LED_PATTERN_ONESHOT_POWEROFF:
@@ -117,6 +129,8 @@ static const char *led_pattern_name(enum sys_led_pattern pattern)
 		return "ONESHOT_COMPLETE";
 	case SYS_LED_PATTERN_ONESHOT_PING:
 		return "ONESHOT_PING";
+	case SYS_LED_PATTERN_ONESHOT_ERROR:
+		return "ONESHOT_ERROR";
 	case SYS_LED_PATTERN_ON_PERSIST:
 		return "ON_PERSIST";
 	case SYS_LED_PATTERN_LONG_PERSIST:
@@ -133,6 +147,30 @@ static const char *led_pattern_name(enum sys_led_pattern pattern)
 		return "ERROR_C";
 	case SYS_LED_PATTERN_ERROR_D:
 		return "ERROR_D";
+	default:
+		return "UNKNOWN";
+	}
+}
+
+static const char *led_color_name(enum sys_led_color color)
+{
+	switch (color) {
+	case SYS_LED_COLOR_DEFAULT:
+		return "DEFAULT";
+	case SYS_LED_COLOR_SUCCESS:
+		return "SUCCESS";
+	case SYS_LED_COLOR_ERROR:
+		return "ERROR";
+	case SYS_LED_COLOR_CHARGING:
+		return "CHARGING";
+	case SYS_LED_COLOR_PAIRING:
+		return "PAIRING";
+	case SYS_LED_COLOR_CALIBRATION:
+		return "CALIBRATION";
+	case SYS_LED_COLOR_CALIBRATION_STABLE:
+		return "CALIBRATION_STABLE";
+	case SYS_LED_COLOR_DEBUG:
+		return "DEBUG";
 	default:
 		return "UNKNOWN";
 	}
@@ -388,46 +426,203 @@ static void led_resume(void)
 #endif
 
 #ifdef LED_RGB_COLOR
-static int led_pwm_period[5][3] = {
+static int led_pwm_period[SYS_LED_COLOR_COUNT][3] = {
 	{CONFIG_LED_DEFAULT_COLOR_R, CONFIG_LED_DEFAULT_COLOR_G, CONFIG_LED_DEFAULT_COLOR_B}, // Default
 	{0, 10000, 0},                                                                        // Success
 	{10000, 0, 0},                                                                        // Error
 	{8000, 2000, 0},                                                                      // Charging
 	{0, 0, 10000},                                                                        // Pairing
+	{0, 8000, 10000},                                                                     // Calibration
+	{0, 10000, 4500},                                                                     // Calibration stable
+	{4500, 0, 10000},                                                                     // Debug
 };
 #elif defined(LED_TRI_COLOR)
-static int led_pwm_period[5][3] = {
+static int led_pwm_period[SYS_LED_COLOR_COUNT][3] = {
 	{0, 0, 10000},   // Default
 	{0, 10000, 0},   // Success
 	{10000, 0, 0},   // Error
 	{6000, 4000, 0}, // Charging
 	{0, 0, 10000},   // Pairing
+	{0, 4000, 10000}, // Calibration
+	{0, 10000, 4500}, // Calibration stable
+	{4500, 0, 10000}, // Debug
 };
 #elif defined(LED_RG_COLOR)
-static int led_pwm_period[5][2] = {
+static int led_pwm_period[SYS_LED_COLOR_COUNT][2] = {
 	{CONFIG_LED_DEFAULT_COLOR_R, CONFIG_LED_DEFAULT_COLOR_G}, // Default
 	{0, 10000},                                               // Success
 	{10000, 0},                                               // Error
 	{8000, 2000},                                             // Charging
 	{4000, 6000},                                             // Pairing
+	{0, 10000},                                               // Calibration
+	{0, 10000},                                               // Calibration stable
+	{10000, 0},                                               // Debug
 };
 #elif defined(LED_DUAL_COLOR)
-static int led_pwm_period[5][2] = {
+static int led_pwm_period[SYS_LED_COLOR_COUNT][2] = {
 	{0, 10000},   // Default
 	{0, 10000},   // Success
 	{10000, 0},   // Error
 	{6000, 4000}, // Charging
 	{0, 10000},   // Pairing
+	{0, 10000},   // Calibration
+	{0, 10000},   // Calibration stable
+	{10000, 0},   // Debug
 };
 #else
-static int led_pwm_period[5][1] = {
+static int led_pwm_period[SYS_LED_COLOR_COUNT][1] = {
 	{10000}, // Default
 	{10000}, // Success
 	{10000}, // Error
 	{10000}, // Charging
 	{10000}, // Pairing
+	{10000}, // Calibration
+	{10000}, // Calibration stable
+	{10000}, // Debug
 };
 #endif
+
+static enum sys_led_color led_effective_color(enum sys_led_color default_color)
+{
+	if (current_led_has_color) {
+		return current_led_color;
+	}
+
+	return default_color;
+}
+
+static bool led_slot_changed(const struct led_slot *a, const struct led_slot *b)
+{
+	return a->pattern != b->pattern ||
+	       a->has_color != b->has_color ||
+	       (a->has_color && a->color != b->color);
+}
+
+static bool led_pattern_is_same_effect(
+	enum sys_led_pattern a_pattern,
+	enum sys_led_color a_color,
+	bool a_has_color,
+	enum sys_led_pattern b_pattern,
+	enum sys_led_color b_color,
+	bool b_has_color
+)
+{
+	return a_pattern == b_pattern &&
+	       a_has_color == b_has_color &&
+	       (!a_has_color || a_color == b_color);
+}
+
+static void led_request(
+	enum sys_led_pattern led_pattern,
+	enum sys_led_color color,
+	bool has_color,
+	int priority
+)
+{
+	enum sys_led_pattern requested_pattern = led_pattern;
+	int requested_priority = priority;
+	enum sys_led_pattern previous_effective = current_led_pattern;
+	enum sys_led_color previous_effective_color = current_led_color;
+	bool previous_effective_has_color = current_led_has_color;
+	int previous_effective_priority = current_priority;
+	int target_priority = priority;
+	struct led_slot previous_slot;
+	enum sys_led_color effective_color = SYS_LED_COLOR_DEFAULT;
+	bool effective_has_color = false;
+	bool effective_found = false;
+
+	if (led_pattern <= SYS_LED_PATTERN_OFF && k_current_get() == led_thread_id) {
+		target_priority = current_priority;
+	}
+	if (target_priority < 0 || target_priority >= SYS_LED_PATTERN_DEPTH) {
+		LOG_WRN("LED request ignored: invalid priority %d", target_priority);
+		return;
+	}
+
+	previous_slot = led_slots[target_priority];
+	led_slots[target_priority].pattern = led_pattern;
+	led_slots[target_priority].color = color;
+	led_slots[target_priority].has_color = has_color && led_pattern > SYS_LED_PATTERN_OFF;
+
+	if (led_slot_changed(&previous_slot, &led_slots[target_priority])) {
+		LOG_INF("LED request: slot=%s %s/%s -> %s/%s request=%s/%s caller=%s",
+			led_priority_name(target_priority),
+			led_pattern_name(previous_slot.pattern),
+			previous_slot.has_color ? led_color_name(previous_slot.color) : "AUTO",
+			led_pattern_name(led_slots[target_priority].pattern),
+			led_slots[target_priority].has_color ? led_color_name(led_slots[target_priority].color) : "AUTO",
+			led_pattern_name(requested_pattern),
+			led_priority_name(requested_priority),
+			led_caller_name());
+	}
+
+	for (priority = 0; priority < SYS_LED_PATTERN_DEPTH; priority++) {
+		if (led_slots[priority].pattern == SYS_LED_PATTERN_OFF) {
+			continue;
+		}
+		led_pattern = led_slots[priority].pattern;
+		effective_color = led_slots[priority].color;
+		effective_has_color = led_slots[priority].has_color;
+		effective_found = true;
+		break;
+	}
+	if (!effective_found) {
+		priority = SYS_LED_PATTERN_DEPTH;
+		led_pattern = SYS_LED_PATTERN_OFF;
+	}
+
+	if (led_pattern > SYS_LED_PATTERN_OFF &&
+	    led_pattern_is_same_effect(
+		    current_led_pattern,
+		    current_led_color,
+		    current_led_has_color,
+		    led_pattern,
+		    effective_color,
+		    effective_has_color)) {
+		current_priority = priority;
+		if (led_slot_changed(&previous_slot, &led_slots[target_priority])) {
+			LOG_INF("LED effective unchanged: %s/%s priority=%s",
+				led_pattern_name(current_led_pattern),
+				current_led_has_color ? led_color_name(current_led_color) : "AUTO",
+				led_priority_name(current_priority));
+		}
+		return;
+	}
+
+	current_led_pattern = led_pattern;
+	current_priority = priority;
+	current_led_color = effective_color;
+	current_led_has_color = effective_has_color;
+	led_pattern_state = 0;
+#ifdef LED_STRIP_EXISTS
+	force_next_strip_update = true;
+#endif
+	LOG_INF("LED effective: %s/%s/%s -> %s/%s/%s",
+		led_pattern_name(previous_effective),
+		previous_effective_has_color ? led_color_name(previous_effective_color) : "AUTO",
+		led_priority_name(previous_effective_priority),
+		led_pattern_name(current_led_pattern),
+		current_led_has_color ? led_color_name(current_led_color) : "AUTO",
+		led_priority_name(current_priority));
+	if (current_led_pattern <= SYS_LED_PATTERN_OFF) {
+		led_suspend();
+		k_thread_suspend(led_thread_id);
+		LOG_DBG("set_led: suspended led_thread_id");
+	} else if (k_current_get() != led_thread_id) // do not suspend if called from thread
+	{
+		k_thread_suspend(led_thread_id);
+		LOG_DBG("set_led: suspended led_thread_id");
+		led_resume();
+		k_thread_resume(led_thread_id);
+		k_wakeup(led_thread_id);
+		LOG_DBG("set_led: resumed led_thread_id");
+	} else {
+		led_resume();
+		k_thread_resume(led_thread_id);
+		k_wakeup(led_thread_id);
+		LOG_DBG("set_led: resumed led_thread_id");
+	}
+}
 
 // Using brightness and value if PWM is supported, otherwise value is coerced to on/off
 // TODO: use computed constants for high/low brightness and color values
@@ -468,6 +663,23 @@ static void led_pin_set(enum sys_led_color color, int brightness_pptt, int value
 	gpio_pin_set_dt(&led, value_pptt > 5000);
 #endif
 }
+
+static int led_breathe_value_pptt(int pattern_state)
+{
+	int led_value = pattern_state > 500 ? 1000 - pattern_state : pattern_state;
+
+	if (led_value < 200) {
+		led_value = led_value * 30;
+	} else if (led_value < 300) {
+		led_value = (led_value - 200) * 20 + 6000;
+	} else if (led_value < 400) {
+		led_value = (led_value - 300) * 15 + 8000;
+	} else {
+		led_value = (led_value - 400) * 5 + 9500;
+	}
+
+	return led_value;
+}
 #endif
 
 void set_led(enum sys_led_pattern led_pattern, int priority)
@@ -475,80 +687,16 @@ void set_led(enum sys_led_pattern led_pattern, int priority)
 	LOG_DBG("set_led: current_led_pattern %d, current_priority %d", current_led_pattern, current_priority);
 	LOG_DBG("set_led: pattern %d, priority %d", led_pattern, priority);
 #if LED_EXISTS || LED_STRIP_EXISTS
-	enum sys_led_pattern requested_pattern = led_pattern;
-	int requested_priority = priority;
-	enum sys_led_pattern previous_effective = current_led_pattern;
-	int previous_effective_priority = current_priority;
-	int target_priority = priority;
-	bool effective_found = false;
-	enum sys_led_pattern previous_slot;
-
-	if (led_pattern <= SYS_LED_PATTERN_OFF && k_current_get() == led_thread_id) {
-		target_priority = current_priority;
-	}
-
-	previous_slot = led_patterns[target_priority];
-	if (led_pattern <= SYS_LED_PATTERN_OFF && k_current_get() == led_thread_id) {
-		led_patterns[current_priority] = led_pattern;
-	} else {
-		led_patterns[priority] = led_pattern;
-	}
-	if (previous_slot != led_patterns[target_priority]) {
-		LOG_INF("LED request: slot=%s %s->%s request=%s/%s caller=%s",
-			led_priority_name(target_priority),
-			led_pattern_name(previous_slot),
-			led_pattern_name(led_patterns[target_priority]),
-			led_pattern_name(requested_pattern),
-			led_priority_name(requested_priority),
-			led_caller_name());
-	}
-	for (priority = 0; priority < SYS_LED_PATTERN_DEPTH; priority++) {
-		if (led_patterns[priority] == SYS_LED_PATTERN_OFF) {
-			continue;
-		}
-		led_pattern = led_patterns[priority];
-		effective_found = true;
-		break;
-	}
-	if (!effective_found) {
-		priority = SYS_LED_PATTERN_DEPTH;
-	}
-	if (led_pattern == current_led_pattern && led_pattern > SYS_LED_PATTERN_OFF) {
-		if (previous_slot != led_patterns[target_priority]) {
-			LOG_INF("LED effective unchanged: %s priority=%s",
-				led_pattern_name(current_led_pattern), led_priority_name(current_priority));
-		}
-		return;
-	}
-	current_led_pattern = led_pattern;
-	current_priority = priority;
-	led_pattern_state = 0;
-#ifdef LED_STRIP_EXISTS
-	force_next_strip_update = true;
+	led_request(led_pattern, SYS_LED_COLOR_DEFAULT, false, priority);
 #endif
-	LOG_INF("LED effective: %s/%s -> %s/%s",
-		led_pattern_name(previous_effective),
-		led_priority_name(previous_effective_priority),
-		led_pattern_name(current_led_pattern),
-		led_priority_name(current_priority));
-	if (current_led_pattern <= SYS_LED_PATTERN_OFF) {
-		led_suspend();
-		k_thread_suspend(led_thread_id);
-		LOG_DBG("set_led: suspended led_thread_id");
-	} else if (k_current_get() != led_thread_id) // do not suspend if called from thread
-	{
-		k_thread_suspend(led_thread_id);
-		LOG_DBG("set_led: suspended led_thread_id");
-		led_resume();
-		k_thread_resume(led_thread_id);
-		k_wakeup(led_thread_id);
-		LOG_DBG("set_led: resumed led_thread_id");
-	} else {
-		led_resume();
-		k_thread_resume(led_thread_id);
-		k_wakeup(led_thread_id);
-		LOG_DBG("set_led: resumed led_thread_id");
-	}
+}
+
+void set_led_color(enum sys_led_pattern led_pattern, enum sys_led_color color, int priority)
+{
+	LOG_DBG("set_led_color: current_led_pattern %d, current_priority %d", current_led_pattern, current_priority);
+	LOG_DBG("set_led_color: pattern %d, color %d, priority %d", led_pattern, color, priority);
+#if LED_EXISTS || LED_STRIP_EXISTS
+	led_request(led_pattern, color, true, priority);
 #endif
 }
 
@@ -564,30 +712,48 @@ static void led_thread(void)
 		LOG_DBG("led_thread: current_led_pattern %d", handled_pattern);
 		switch (handled_pattern) {
 		case SYS_LED_PATTERN_ON:
-			led_pin_set(SYS_LED_COLOR_DEFAULT, 10000, 10000);
+			led_pin_set(led_effective_color(SYS_LED_COLOR_DEFAULT), 10000, 10000);
 			if (current_led_pattern == handled_pattern) {
 				k_thread_suspend(led_thread_id);
 			}
 			break;
 		case SYS_LED_PATTERN_SHORT:
 			led_pattern_state = (led_pattern_state + 1) % 2;
-			led_pin_set(SYS_LED_COLOR_PAIRING, 10000, led_pattern_state * 10000);
+			led_pin_set(led_effective_color(SYS_LED_COLOR_PAIRING), 10000, led_pattern_state * 10000);
 			k_msleep(led_pattern_state == 1 ? 100 : 900);
 			break;
 		case SYS_LED_PATTERN_LONG:
 			led_pattern_state = (led_pattern_state + 1) % 2;
-			led_pin_set(SYS_LED_COLOR_DEFAULT, 10000, led_pattern_state * 10000);
+			led_pin_set(led_effective_color(SYS_LED_COLOR_DEFAULT), 10000, led_pattern_state * 10000);
 			k_msleep(500);
 			break;
 		case SYS_LED_PATTERN_FLASH:
 			led_pattern_state = (led_pattern_state + 1) % 2;
-			led_pin_set(SYS_LED_COLOR_DEFAULT, 10000, led_pattern_state * 10000);
+			led_pin_set(led_effective_color(SYS_LED_COLOR_DEFAULT), 10000, led_pattern_state * 10000);
 			k_msleep(200);
+			break;
+		case SYS_LED_PATTERN_BREATH_SLOW:
+			led_pattern_state = (led_pattern_state + 1) % 1000;
+			led_pin_set(
+				led_effective_color(SYS_LED_COLOR_DEFAULT),
+				10000,
+				led_breathe_value_pptt(led_pattern_state)
+			);
+			k_msleep(5);
+			break;
+		case SYS_LED_PATTERN_BREATH_FAST:
+			led_pattern_state = (led_pattern_state + 1) % 1000;
+			led_pin_set(
+				led_effective_color(SYS_LED_COLOR_DEFAULT),
+				10000,
+				led_breathe_value_pptt(led_pattern_state)
+			);
+			k_msleep(2);
 			break;
 
 		case SYS_LED_PATTERN_ONESHOT_POWERON:
 			led_pattern_state++;
-			led_pin_set(SYS_LED_COLOR_DEFAULT, 10000, !(led_pattern_state % 2) * 10000);
+			led_pin_set(led_effective_color(SYS_LED_COLOR_DEFAULT), 10000, !(led_pattern_state % 2) * 10000);
 			if (led_pattern_state == 7) {
 				set_led(SYS_LED_PATTERN_OFF, SYS_LED_PRIORITY_HIGHEST);
 			} else {
@@ -597,12 +763,12 @@ static void led_thread(void)
 		case SYS_LED_PATTERN_ONESHOT_POWEROFF:
 			if (led_pattern_state++ > 0) {
 				led_pin_set(
-					SYS_LED_COLOR_DEFAULT,
+					led_effective_color(SYS_LED_COLOR_DEFAULT),
 					(202 - led_pattern_state) * 50,
 					(led_pattern_state != 202 ? 10000 : 0)
 				);
 			} else {
-				led_pin_set(SYS_LED_COLOR_DEFAULT, 10000, 0);
+				led_pin_set(led_effective_color(SYS_LED_COLOR_DEFAULT), 10000, 0);
 			}
 			if (led_pattern_state == 202) {
 				set_led(SYS_LED_PATTERN_OFF_FORCE, SYS_LED_PRIORITY_HIGHEST);
@@ -614,7 +780,7 @@ static void led_thread(void)
 			break;
 		case SYS_LED_PATTERN_ONESHOT_PROGRESS:
 			led_pattern_state++;
-			led_pin_set(SYS_LED_COLOR_SUCCESS, 10000, !(led_pattern_state % 2) * 10000);
+			led_pin_set(led_effective_color(SYS_LED_COLOR_SUCCESS), 10000, !(led_pattern_state % 2) * 10000);
 			if (led_pattern_state == 5) {
 				set_led(SYS_LED_PATTERN_OFF, SYS_LED_PRIORITY_HIGHEST);
 			} else {
@@ -623,7 +789,7 @@ static void led_thread(void)
 			break;
 		case SYS_LED_PATTERN_ONESHOT_COMPLETE:
 			led_pattern_state++;
-			led_pin_set(SYS_LED_COLOR_SUCCESS, 10000, !(led_pattern_state % 2) * 10000);
+			led_pin_set(led_effective_color(SYS_LED_COLOR_SUCCESS), 10000, !(led_pattern_state % 2) * 10000);
 			if (led_pattern_state == 9) {
 				set_led(SYS_LED_PATTERN_OFF, SYS_LED_PRIORITY_HIGHEST);
 			} else {
@@ -632,67 +798,82 @@ static void led_thread(void)
 			break;
 		case SYS_LED_PATTERN_ONESHOT_PING:
 			led_pattern_state++;
-			led_pin_set(SYS_LED_COLOR_DEFAULT, 10000, (led_pattern_state % 2) * 10000);
+			led_pin_set(led_effective_color(SYS_LED_COLOR_DEFAULT), 10000, (led_pattern_state % 2) * 10000);
 			if (led_pattern_state == 20) { // 10 flashes (states 1-20), turn off at 20
 				set_led(SYS_LED_PATTERN_OFF, SYS_LED_PRIORITY_HIGHEST);
 			} else {
 				k_msleep(200);
 			}
 			break;
+		case SYS_LED_PATTERN_ONESHOT_ERROR:
+			led_pattern_state++;
+			led_pin_set(led_effective_color(SYS_LED_COLOR_ERROR), 10000, (led_pattern_state % 2) * 10000);
+			if (led_pattern_state == 6) {
+				set_led(SYS_LED_PATTERN_OFF, SYS_LED_PRIORITY_HIGHEST);
+			} else {
+				k_msleep(150);
+			}
+			break;
 
 		case SYS_LED_PATTERN_ON_PERSIST:
-			led_pin_set(SYS_LED_COLOR_SUCCESS, 2000, 10000);
+			led_pin_set(led_effective_color(SYS_LED_COLOR_SUCCESS), 2000, 10000);
 			if (current_led_pattern == handled_pattern) {
 				k_thread_suspend(led_thread_id);
 			}
 			break;
 		case SYS_LED_PATTERN_LONG_PERSIST:
 			led_pattern_state = (led_pattern_state + 1) % 2;
-			led_pin_set(SYS_LED_COLOR_CHARGING, 2000, led_pattern_state * 10000);
+			led_pin_set(led_effective_color(SYS_LED_COLOR_CHARGING), 2000, led_pattern_state * 10000);
 			k_msleep(500);
 			break;
 		case SYS_LED_PATTERN_PULSE_PERSIST:
 			led_pattern_state = (led_pattern_state + 1) % 1000;
 			//			float led_value = sinf(led_pattern_state * (M_PI / 1000));
 			//			led_pin_set(SYS_LED_COLOR_CHARGING, 10000, led_value * 10000);
-			int led_value = led_pattern_state > 500 ? 1000 - led_pattern_state : led_pattern_state;
-			if (led_value < 200) {
-				led_value = (led_value) * 30;
-			} else if (led_value < 300) {
-				led_value = (led_value - 200) * 20 + 6000;
-			} else if (led_value < 400) {
-				led_value = (led_value - 300) * 15 + 8000;
-			} else {
-				led_value = (led_value - 400) * 5 + 9500;
-			}
-			led_pin_set(SYS_LED_COLOR_CHARGING, 10000, led_value);
+			led_pin_set(
+				led_effective_color(SYS_LED_COLOR_CHARGING),
+				10000,
+				led_breathe_value_pptt(led_pattern_state)
+			);
 			k_msleep(5);
 			break;
 		case SYS_LED_PATTERN_ACTIVE_PERSIST: // off duration first because the device may turn on multiple times rapidly
 											 // and waste battery power
 			led_pattern_state = (led_pattern_state + 1) % 2;
-			led_pin_set(SYS_LED_COLOR_DEFAULT, 10000, !led_pattern_state * 10000);
+			led_pin_set(led_effective_color(SYS_LED_COLOR_DEFAULT), 10000, !led_pattern_state * 10000);
 			k_msleep(led_pattern_state ? 9700 : 300);
 			break;
 
 		case SYS_LED_PATTERN_ERROR_A: // TODO: should this use 20% duty cycle?
 			led_pattern_state = (led_pattern_state + 1) % 10;
-			led_pin_set(SYS_LED_COLOR_ERROR, 10000, (led_pattern_state < 4 && led_pattern_state % 2) * 10000);
+			led_pin_set(
+				led_effective_color(SYS_LED_COLOR_ERROR),
+				10000,
+				(led_pattern_state < 4 && led_pattern_state % 2) * 10000
+			);
 			k_msleep(500);
 			break;
 		case SYS_LED_PATTERN_ERROR_B:
 			led_pattern_state = (led_pattern_state + 1) % 10;
-			led_pin_set(SYS_LED_COLOR_ERROR, 10000, (led_pattern_state < 6 && led_pattern_state % 2) * 10000);
+			led_pin_set(
+				led_effective_color(SYS_LED_COLOR_ERROR),
+				10000,
+				(led_pattern_state < 6 && led_pattern_state % 2) * 10000
+			);
 			k_msleep(500);
 			break;
 		case SYS_LED_PATTERN_ERROR_C:
 			led_pattern_state = (led_pattern_state + 1) % 10;
-			led_pin_set(SYS_LED_COLOR_ERROR, 10000, (led_pattern_state < 8 && led_pattern_state % 2) * 10000);
+			led_pin_set(
+				led_effective_color(SYS_LED_COLOR_ERROR),
+				10000,
+				(led_pattern_state < 8 && led_pattern_state % 2) * 10000
+			);
 			k_msleep(500);
 			break;
 		case SYS_LED_PATTERN_ERROR_D:
 			led_pattern_state = (led_pattern_state + 1) % 2;
-			led_pin_set(SYS_LED_COLOR_ERROR, 10000, led_pattern_state * 10000);
+			led_pin_set(led_effective_color(SYS_LED_COLOR_ERROR), 10000, led_pattern_state * 10000);
 			k_msleep(500);
 			break;
 

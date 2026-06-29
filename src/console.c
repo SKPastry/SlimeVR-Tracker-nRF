@@ -530,6 +530,9 @@ static void print_help(void)
 #if CONFIG_SENSOR_USE_TCAL
 	// Update the help string to show the new command set
 	printk("  tcal <on|off|status|dump|test temp|remove index|auto on|auto off> Temperature calibration\n");
+#if CONFIG_SENSOR_TCAL_HEATED
+	printk("  tcal heat <start [temp]|stop|status|duty pptt|tune kp|ki|kff value> Heated T-Cal\n");
+#endif
 #endif
 	printk("\n");
 	printk("Connection:\n");
@@ -988,6 +991,75 @@ static void console_thread(void)
 					printk("Auto-calibration: %s\n", sensor_tcal_get_auto_calibration() ? "enabled" : "disabled");
 				} else if (strcmp(subcmd, "clear") == 0) {
 					cmd_reset_tcal();
+#if CONFIG_SENSOR_TCAL_HEATED
+				} else if (strcmp(subcmd, "heat") == 0) {
+					char *heat_arg = strtok(NULL, " ");
+					if (heat_arg == NULL || strcmp(heat_arg, "status") == 0) {
+						sensor_tcal_heated_status();
+					} else if (strcmp(heat_arg, "start") == 0) {
+						char *target_str = strtok(NULL, " ");
+						float target_temp = NAN;
+						if (target_str != NULL) {
+							char *endptr = NULL;
+							target_temp = strtof(target_str, &endptr);
+							if (endptr == target_str || *endptr != '\0') {
+								printk("Error: Invalid target temperature '%s'. Use: tcal heat start [temp]\n", target_str);
+								continue;
+							}
+						}
+						int err = sensor_tcal_heated_start(target_temp);
+						if (err) {
+							printk("Error: Heated T-Cal start failed (%d).\n", err);
+						} else {
+							printk("Heated T-Cal started.\n");
+						}
+					} else if (strcmp(heat_arg, "stop") == 0) {
+						sensor_tcal_heated_stop();
+						printk("Heated T-Cal stopped.\n");
+					} else if (strcmp(heat_arg, "duty") == 0) {
+						char *duty_str = strtok(NULL, " ");
+						if (duty_str == NULL) {
+							printk("Error: Missing duty. Use: tcal heat duty <pptt>\n");
+							continue;
+						}
+						char *endptr = NULL;
+						long duty = strtol(duty_str, &endptr, 10);
+						if (endptr == duty_str || *endptr != '\0' || duty < 0 || duty > 10000) {
+							printk("Error: Invalid duty '%s'. Use 0..10000 pptt.\n", duty_str);
+							continue;
+						}
+						int err = sensor_tcal_heated_set_open_loop_duty((uint16_t)duty);
+						if (err) {
+							printk("Error: Heated T-Cal duty failed (%d).\n", err);
+						} else {
+							printk("Heated T-Cal open-loop duty set to %ld pptt.\n", duty);
+						}
+					} else if (strcmp(heat_arg, "tune") == 0) {
+						char *param = strtok(NULL, " ");
+						char *value_str = strtok(NULL, " ");
+						if (param == NULL || value_str == NULL) {
+							printk("Error: Use: tcal heat tune <kp|ki|kff> <value>\n");
+							continue;
+						}
+						char *endptr = NULL;
+						float value = strtof(value_str, &endptr);
+						if (endptr == value_str || *endptr != '\0') {
+							printk("Error: Invalid tune value '%s'.\n", value_str);
+							continue;
+						}
+						int err = sensor_tcal_heated_tune(param, value);
+						if (err) {
+							printk("Error: Heated T-Cal tune failed (%d).\n", err);
+						} else {
+							printk("Heated T-Cal tune updated: %s = %.4f\n", param, (double)value);
+						}
+					} else {
+						printk("Error: Invalid heat command '%s'. Use: tcal heat <start [temp]|stop|status|duty pptt|tune kp|ki|kff value>\n", heat_arg);
+					}
+#else
+				} else if (strcmp(subcmd, "heat") == 0) {
+					printk("Error: Heated T-Cal not enabled.\n");
+#endif
 				} else if (strcmp(subcmd, "auto") == 0) {
 					char *auto_arg = strtok(NULL, " ");
 					if (auto_arg == NULL) {
@@ -1132,7 +1204,7 @@ static void console_thread(void)
 						printk("Error: Invalid argument '%s'. Use: tcal boot <on|off>\n", boot_arg);
 					}
 				} else {
-					printk("Error: Invalid argument '%s'. Use: <status|clear|dump|test temp|remove index|check|auto on|auto off|boot on|boot off>\n", subcmd);
+					printk("Error: Invalid argument '%s'. Use: <status|clear|dump|test temp|remove index|check|auto on|auto off|boot on|boot off|heat ...>\n", subcmd);
 				}
 			}
 		}
