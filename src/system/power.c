@@ -442,6 +442,7 @@ static void sys_WOM(bool force) // TODO: if IMU interrupt does not exist what do
 //	retained_update();
 	wait_for_logging();
 #if ADAFRUIT_BOOTLOADER // if using Adafruit bootloader, always skip dfu for next boot
+	NRF_POWER->GPREGRET = ADAFRUIT_DFU_MAGIC_SKIP;
 	(*dbl_reset_mem) = DFU_DBL_RESET_APP; // Skip DFU
 #endif
 	sys_poweroff();
@@ -487,6 +488,7 @@ static void sys_system_off(void) // TODO: add timeout
 	// retained_update();
 	wait_for_logging();
 #if ADAFRUIT_BOOTLOADER // if using Adafruit bootloader, always skip dfu for next boot
+	NRF_POWER->GPREGRET = ADAFRUIT_DFU_MAGIC_SKIP;
 	(*dbl_reset_mem) = DFU_DBL_RESET_APP; // Skip DFU
 #endif
 	sys_poweroff();

@@ -31,6 +31,7 @@
 // See: Adafruit_nRF52_Bootloader/src/main.c (DFU_MAGIC_*).
 #define ADAFRUIT_DFU_MAGIC_UF2_RESET 0x57
 #define ADAFRUIT_DFU_MAGIC_OTA_RESET 0xA8
+#define ADAFRUIT_DFU_MAGIC_SKIP 0x6D
 
 #define USER_SHUTDOWN_ENABLED CONFIG_USER_SHUTDOWN // Allow user to use reset or sw0 to shutdown
 #ifdef CONFIG_IGNORE_CHARGE_WAKE_ON_VBUS
