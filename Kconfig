@@ -402,6 +402,27 @@ config SENSOR_USE_TCAL
         This controls whether the firmware collects/uses temperature-related
         calibration data to compensate gyroscope bias drift.
 
+config SYSTEM_IMU_HEATER
+    bool "Enable IMU heater control"
+    default y if BOARD_SK_CHEESECAKE_NRF_P00 || BOARD_SK_CHEESECAKE_NRF_P00_DEV || BOARD_SK_CHEESECAKE_NRF_P00_UF2
+    default n
+    depends on PWM && GPIO
+    help
+        Enable board-provided IMU heater control for heated temperature
+        calibration.
+
+config SYSTEM_IMU_HEATER_MAX_DUTY_PPTT
+    int "IMU heater maximum duty (parts per ten thousand)"
+    default 6000
+    depends on SYSTEM_IMU_HEATER
+    range 0 10000
+
+config SYSTEM_IMU_HEATER_PERIOD_MS
+    int "IMU heater PWM period (ms)"
+    default 20
+    depends on SYSTEM_IMU_HEATER
+    range 1 1000
+
 menu "Temperature Calibration Settings"
 depends on SENSOR_USE_TCAL
 
@@ -439,6 +460,84 @@ config SENSOR_USE_BOOT_CALIBRATION
         Boot calibration occurs within 15-50 seconds after boot when the
         device is stationary and requires at least 4 temperature calibration
         points to be effective.
+
+config SENSOR_TCAL_HEATED
+    bool "Enable heated T-Cal workflow"
+    default y if SYSTEM_IMU_HEATER
+    depends on SYSTEM_IMU_HEATER
+    help
+        Enable explicit tcal heat commands that slowly heat the IMU while
+        collecting temperature calibration buckets.
+
+config SENSOR_TCAL_HEATED_REQUIRE_PLUGGED
+    bool "Require external power for heated T-Cal"
+    default y
+    depends on SENSOR_TCAL_HEATED
+
+config SENSOR_TCAL_HEATED_DEFAULT_TARGET_C
+    int "Heated T-Cal default target temperature (C)"
+    default SENSOR_POLY_TEMP_MAX
+    depends on SENSOR_TCAL_HEATED
+
+config SENSOR_TCAL_HEATED_MAX_TEMP_C
+    int "Heated T-Cal hard maximum temperature (C)"
+    default 50
+    depends on SENSOR_TCAL_HEATED
+
+config SENSOR_TCAL_HEATED_RAMP_MCPS
+    int "Heated T-Cal ramp rate (mC/s)"
+    default 30
+    depends on SENSOR_TCAL_HEATED
+
+config SENSOR_TCAL_HEATED_STABLE_MS
+    int "Heated T-Cal stable hold time (ms)"
+    default 60000
+    depends on SENSOR_TCAL_HEATED
+
+config SENSOR_TCAL_HEATED_STABLE_BAND_MC
+    int "Heated T-Cal stable band (mC)"
+    default 500
+    depends on SENSOR_TCAL_HEATED
+
+config SENSOR_TCAL_HEATED_MAX_RISE_MCPS
+    int "Heated T-Cal maximum temperature rise rate (mC/s)"
+    default 200
+    depends on SENSOR_TCAL_HEATED
+
+config SENSOR_TCAL_HEATED_TIMEOUT_MIN
+    int "Heated T-Cal timeout (minutes)"
+    default 30
+    depends on SENSOR_TCAL_HEATED
+
+config SENSOR_TCAL_HEATED_RESUME_STABLE_MS
+    int "Heated T-Cal rest time before resuming ramp (ms)"
+    default 5000
+    depends on SENSOR_TCAL_HEATED
+
+config SENSOR_TCAL_HEATED_SLEW_PPTT_PER_S
+    int "Heated T-Cal duty slew limit (pptt/s)"
+    default 500
+    depends on SENSOR_TCAL_HEATED
+
+config SENSOR_TCAL_HEATED_DEFAULT_KP
+    int "Heated T-Cal default Kp (pptt/C)"
+    default 800
+    depends on SENSOR_TCAL_HEATED
+
+config SENSOR_TCAL_HEATED_DEFAULT_KI
+    int "Heated T-Cal default Ki (pptt/C/s)"
+    default 20
+    depends on SENSOR_TCAL_HEATED
+
+config SENSOR_TCAL_HEATED_DEFAULT_KFF
+    int "Heated T-Cal default feed-forward gain (pptt/C)"
+    default 0
+    depends on SENSOR_TCAL_HEATED
+
+config SENSOR_TCAL_HEATED_DEBUG_LOG
+    bool "Enable heated T-Cal CSV debug log"
+    default n
+    depends on SENSOR_TCAL_HEATED
 
 endmenu
 

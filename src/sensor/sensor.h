@@ -23,6 +23,9 @@
 #ifndef SLIMENRF_SENSOR
 #define SLIMENRF_SENSOR
 
+#include <stdbool.h>
+#include <stdint.h>
+
 #include "interface.h"
 
 const char* sensor_get_sensor_imu_name(void);
@@ -62,6 +65,7 @@ void main_imu_restart(void);
 
 #if CONFIG_SENSOR_USE_TCAL
 float sensor_get_current_imu_temperature(void);
+int sensor_get_current_imu_temperature_checked(float *temp, int64_t max_age_ms);
 #endif
 
 // Get actual sensor ODR (Output Data Rate) in Hz

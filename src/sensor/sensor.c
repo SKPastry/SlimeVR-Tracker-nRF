@@ -22,6 +22,7 @@
 */
 #include "globals.h"
 #include "system/system.h"
+#include "system/heater.h"
 #include "system/power.h"
 #include "system/test_mode.h"
 #include "system/esb_ota.h"
@@ -30,6 +31,7 @@
 #include "connection/connection.h"
 #include "calibration.h"
 
+#include <errno.h>
 #include <math.h>
 #include <hal/nrf_gpio.h>
 
@@ -741,6 +743,7 @@ void sensor_retained_write(void) // TODO: move to sys?
 
 void sensor_shutdown(void) // Communicate all imus to shut down
 {
+	heater_force_off();
 	int err = sensor_request_scan(false); // try initialization if possible
 	if (mag_available || !err)
 	{
@@ -2132,12 +2135,24 @@ void sensor_loop(void)
 			}
 
 #if CONFIG_SENSOR_USE_TCAL
+#if CONFIG_SENSOR_TCAL_HEATED
+			sensor_tcal_heated_update(resting);
+			if (sensor_tcal_heated_is_active()) {
+				last_data_time = now;
+			}
+#endif
 			// Check for boot calibration (higher priority than auto calibration)
+#if CONFIG_SENSOR_TCAL_HEATED
+			if (!sensor_tcal_heated_is_active()) {
+#endif
 			sensor_tcal_boot_calibration_check();
 
 			// Check for runtime periodic calibration (when device is resting for extended period)
 			// This helps maintain accuracy during long usage sessions by updating D_offset
 			sensor_runtime_calibration_check(resting);
+#if CONFIG_SENSOR_TCAL_HEATED
+			}
+#endif
 
 			// Notify continuous bucket sampling of motion state changes
 			if (!resting) {
@@ -2253,6 +2268,7 @@ void wait_for_threads(void) // TODO: add timeout
 
 void main_imu_suspend(void) // TODO: add timeout
 {
+	heater_force_off();
 	main_suspended = true;
 	if (!main_running) // don't suspend if already stopped (TODO: may be called from sensor thread)
 		return;
@@ -2319,6 +2335,26 @@ float sensor_get_current_imu_temperature(void)
 	// If the filter hasn't been initialized yet, fall back to the last raw reading.
 	// This avoids returning the default 25C for a short window at startup.
 	return sensor_tcal_temp_filter_initialized ? sensor_tcal_temp : sensor_tcal_temp_raw;
+}
+
+int sensor_get_current_imu_temperature_checked(float *out, int64_t max_age_ms)
+{
+	if (!out) {
+		return -EINVAL;
+	}
+
+	int64_t age_ms = k_uptime_get() - last_temp_time;
+	if (last_temp_time < 0 || age_ms < 0 || age_ms > max_age_ms) {
+		return -ETIMEDOUT;
+	}
+
+	float current_temp = sensor_tcal_temp_filter_initialized ? sensor_tcal_temp : sensor_tcal_temp_raw;
+	if (isnan(current_temp) || current_temp <= -20.0f || current_temp >= 60.0f) {
+		return -ERANGE;
+	}
+
+	*out = current_temp;
+	return 0;
 }
 #endif
 
