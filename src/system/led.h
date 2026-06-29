@@ -40,12 +40,15 @@ enum sys_led_pattern {
 						   // (pairing)
 	SYS_LED_PATTERN_LONG,  // 500ms on 500ms off										// Default | indicates waiting
 	SYS_LED_PATTERN_FLASH, // 200ms on 200ms off									// Default | indicates readiness
+	SYS_LED_PATTERN_BREATH_SLOW, // 5000ms breathing								// Calibration ramp
+	SYS_LED_PATTERN_BREATH_FAST, // 2000ms breathing								// Calibration hold
 
 	SYS_LED_PATTERN_ONESHOT_POWERON,  // 200ms on 200ms off, 3 times					// Default
 	SYS_LED_PATTERN_ONESHOT_POWEROFF, // 250ms off, 1000ms fade to off				// Default
 	SYS_LED_PATTERN_ONESHOT_PROGRESS, // 200ms on 200ms off, 2 times				// Success
 	SYS_LED_PATTERN_ONESHOT_COMPLETE, // 200ms on 200ms off, 4 times				// Success
 	SYS_LED_PATTERN_ONESHOT_PING,     // 200ms on 200ms off, 10 times				// Ping
+	SYS_LED_PATTERN_ONESHOT_ERROR,    // 150ms on 150ms off, 3 times				// Error
 
 	SYS_LED_PATTERN_ON_PERSIST,     // 20% duty cycle									// Success | indicates charged
 	SYS_LED_PATTERN_LONG_PERSIST,   // 20% duty cycle, 500ms on 500ms off				// Charging| indicates low battery
@@ -65,8 +68,13 @@ enum sys_led_color {
 	SYS_LED_COLOR_ERROR,
 	SYS_LED_COLOR_CHARGING,
 	SYS_LED_COLOR_PAIRING,
+	SYS_LED_COLOR_CALIBRATION,
+	SYS_LED_COLOR_CALIBRATION_STABLE,
+	SYS_LED_COLOR_DEBUG,
+	SYS_LED_COLOR_COUNT,
 };
 
 void set_led(enum sys_led_pattern led_pattern, int priority);
+void set_led_color(enum sys_led_pattern led_pattern, enum sys_led_color color, int priority);
 
 #endif
