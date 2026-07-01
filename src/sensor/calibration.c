@@ -447,6 +447,9 @@ static struct {
 	int64_t stable_start_time;
 	int64_t rest_start_time;
 	uint16_t staged_count;
+	enum sys_led_pattern led_pattern;
+	int led_progress_step;
+	bool led_cache_valid;
 } tcal_heated = {
 	.state = TCAL_HEATED_STATE_IDLE,
 };
@@ -4015,7 +4018,97 @@ static const char *tcal_heated_stop_reason_name(tcal_heated_stop_reason_t reason
 	}
 }
 
-static void tcal_heated_update_led(void)
+#define TCAL_HEATED_LED_GRADIENT_STEPS 64
+
+static const struct sys_led_rgb_pptt tcal_heated_led_low_temp = {0, 8000, 10000};
+static const struct sys_led_rgb_pptt tcal_heated_led_high_temp = {10000, 2500, 0};
+
+static uint16_t tcal_heated_led_lerp_channel(uint16_t low, uint16_t high, int step)
+{
+	int value = low + ((int)high - (int)low) * step / TCAL_HEATED_LED_GRADIENT_STEPS;
+
+	if (value < 0) {
+		return 0;
+	}
+	if (value > 10000) {
+		return 10000;
+	}
+
+	return (uint16_t)value;
+}
+
+static int tcal_heated_led_progress_step(float current_temp)
+{
+	float span = tcal_heated.target_temp - tcal_heated.ambient_temp;
+	float progress;
+
+	if (isnan(current_temp)) {
+		current_temp = tcal_heated.last_temp;
+	}
+	if (isnan(current_temp) || span <= 0.01f) {
+		return TCAL_HEATED_LED_GRADIENT_STEPS;
+	}
+
+	progress = (current_temp - tcal_heated.ambient_temp) / span;
+	if (progress < 0.0f) {
+		progress = 0.0f;
+	} else if (progress > 1.0f) {
+		progress = 1.0f;
+	}
+
+	return (int)(progress * (float)TCAL_HEATED_LED_GRADIENT_STEPS + 0.5f);
+}
+
+static struct sys_led_rgb_pptt tcal_heated_led_gradient_color(int step)
+{
+	if (step < 0) {
+		step = 0;
+	} else if (step > TCAL_HEATED_LED_GRADIENT_STEPS) {
+		step = TCAL_HEATED_LED_GRADIENT_STEPS;
+	}
+
+	return (struct sys_led_rgb_pptt){
+		.r = tcal_heated_led_lerp_channel(tcal_heated_led_low_temp.r, tcal_heated_led_high_temp.r, step),
+		.g = tcal_heated_led_lerp_channel(tcal_heated_led_low_temp.g, tcal_heated_led_high_temp.g, step),
+		.b = tcal_heated_led_lerp_channel(tcal_heated_led_low_temp.b, tcal_heated_led_high_temp.b, step),
+	};
+}
+
+static void tcal_heated_set_gradient_led(enum sys_led_pattern pattern, float current_temp)
+{
+	int step = tcal_heated_led_progress_step(current_temp);
+
+	if (tcal_heated.led_cache_valid &&
+	    tcal_heated.led_pattern == pattern &&
+	    tcal_heated.led_progress_step == step) {
+		return;
+	}
+
+	tcal_heated.led_pattern = pattern;
+	tcal_heated.led_progress_step = step;
+	tcal_heated.led_cache_valid = true;
+	set_led_rgb(
+		pattern,
+		tcal_heated_led_gradient_color(step),
+		SYS_LED_PRIORITY_SENSOR
+	);
+}
+
+static void tcal_heated_set_debug_led(void)
+{
+	if (tcal_heated.led_cache_valid &&
+	    tcal_heated.led_pattern == SYS_LED_PATTERN_BREATH_SLOW &&
+	    tcal_heated.led_progress_step == -1) {
+		return;
+	}
+
+	tcal_heated.led_pattern = SYS_LED_PATTERN_BREATH_SLOW;
+	tcal_heated.led_progress_step = -1;
+	tcal_heated.led_cache_valid = true;
+	set_led_color(SYS_LED_PATTERN_BREATH_SLOW, SYS_LED_COLOR_DEBUG, SYS_LED_PRIORITY_SENSOR);
+}
+
+static void tcal_heated_update_led(float current_temp)
 {
 	if (!tcal_heated.active) {
 		return;
@@ -4023,20 +4116,16 @@ static void tcal_heated_update_led(void)
 
 	switch (tcal_heated.state) {
 	case TCAL_HEATED_STATE_RAMP:
-		set_led_color(SYS_LED_PATTERN_BREATH_SLOW, SYS_LED_COLOR_CALIBRATION, SYS_LED_PRIORITY_SENSOR);
+		tcal_heated_set_gradient_led(SYS_LED_PATTERN_BREATH_SLOW, current_temp);
 		break;
 	case TCAL_HEATED_STATE_HOLD:
-		set_led_color(
-			SYS_LED_PATTERN_BREATH_FAST,
-			tcal_heated.stable_start_time > 0 ? SYS_LED_COLOR_CALIBRATION_STABLE : SYS_LED_COLOR_CALIBRATION,
-			SYS_LED_PRIORITY_SENSOR
-		);
+		tcal_heated_set_gradient_led(SYS_LED_PATTERN_BREATH_FAST, current_temp);
 		break;
 	case TCAL_HEATED_STATE_MOTION_HOLD:
-		set_led_color(SYS_LED_PATTERN_ERROR_A, SYS_LED_COLOR_CALIBRATION, SYS_LED_PRIORITY_SENSOR);
+		tcal_heated_set_gradient_led(SYS_LED_PATTERN_ERROR_A, current_temp);
 		break;
 	case TCAL_HEATED_STATE_OPEN_LOOP:
-		set_led_color(SYS_LED_PATTERN_BREATH_SLOW, SYS_LED_COLOR_DEBUG, SYS_LED_PRIORITY_SENSOR);
+		tcal_heated_set_debug_led();
 		break;
 	case TCAL_HEATED_STATE_IDLE:
 	case TCAL_HEATED_STATE_STOPPED:
@@ -4458,6 +4547,7 @@ int sensor_tcal_heated_start(float target_temp)
 	tcal_heated.last_control_time = now;
 	tcal_heated.stable_start_time = 0;
 	tcal_heated.rest_start_time = now;
+	tcal_heated.led_cache_valid = false;
 
 	LOG_INF(
 		"Heated T-Cal started: current %.2fC, target %.2fC, Kp %.2f, Ki %.2f, Kff %.2f",
@@ -4467,7 +4557,7 @@ int sensor_tcal_heated_start(float target_temp)
 		(double)tcal_heated.ki,
 		(double)tcal_heated.kff
 	);
-	tcal_heated_update_led();
+	tcal_heated_update_led(current_temp);
 	return 0;
 }
 
@@ -4521,7 +4611,8 @@ int sensor_tcal_heated_set_open_loop_duty(uint16_t duty_pptt)
 	tcal_heated.last_temp = current_temp;
 	tcal_heated.last_control_time = now;
 	tcal_heated.duty_pptt = MIN(duty_pptt, CONFIG_SYSTEM_IMU_HEATER_MAX_DUTY_PPTT);
-	tcal_heated_update_led();
+	tcal_heated.led_cache_valid = false;
+	tcal_heated_update_led(current_temp);
 	return 0;
 }
 
@@ -4641,7 +4732,7 @@ void sensor_tcal_heated_update(bool is_resting)
 		}
 	}
 
-	tcal_heated_update_led();
+	tcal_heated_update_led(current_temp);
 
 	int64_t dt_ms = now - tcal_heated.last_control_time;
 	if (dt_ms < 1000) {
@@ -4687,7 +4778,7 @@ void sensor_tcal_heated_update(bool is_resting)
 		tcal_heated.stable_start_time = 0;
 	}
 
-	tcal_heated_update_led();
+	tcal_heated_update_led(current_temp);
 
 	float error = tcal_heated.setpoint_temp - current_temp;
 	float ff_out = tcal_heated.kff * MAX(tcal_heated.setpoint_temp - tcal_heated.ambient_temp, 0.0f);

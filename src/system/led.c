@@ -87,12 +87,22 @@ struct led_slot {
 	enum sys_led_pattern pattern;
 	enum sys_led_color color;
 	bool has_color;
+	struct sys_led_rgb_pptt rgb;
+	bool has_rgb;
 };
 
 static struct led_slot led_slots[SYS_LED_PATTERN_DEPTH]
-	= {[0 ...(SYS_LED_PATTERN_DEPTH - 1)] = {SYS_LED_PATTERN_OFF, SYS_LED_COLOR_DEFAULT, false}};
+	= {[0 ...(SYS_LED_PATTERN_DEPTH - 1)] = {
+		   .pattern = SYS_LED_PATTERN_OFF,
+		   .color = SYS_LED_COLOR_DEFAULT,
+		   .has_color = false,
+		   .rgb = {0, 0, 0},
+		   .has_rgb = false,
+	   }};
 static enum sys_led_color current_led_color;
 static bool current_led_has_color;
+static struct sys_led_rgb_pptt current_led_rgb;
+static bool current_led_has_rgb;
 static int led_pattern_state;
 #ifdef LED_EN_EXISTS
 static bool led_powered;
@@ -174,6 +184,54 @@ static const char *led_color_name(enum sys_led_color color)
 	default:
 		return "UNKNOWN";
 	}
+}
+
+static bool led_rgb_equal(const struct sys_led_rgb_pptt *a, const struct sys_led_rgb_pptt *b)
+{
+	return a->r == b->r && a->g == b->g && a->b == b->b;
+}
+
+static struct sys_led_rgb_pptt led_rgb_clamp(struct sys_led_rgb_pptt color)
+{
+	if (color.r > 10000) {
+		color.r = 10000;
+	}
+	if (color.g > 10000) {
+		color.g = 10000;
+	}
+	if (color.b > 10000) {
+		color.b = 10000;
+	}
+
+	return color;
+}
+
+static const char *led_slot_color_label(const struct led_slot *slot)
+{
+	if (slot->has_rgb) {
+		return "RGB";
+	}
+	if (slot->has_color) {
+		return led_color_name(slot->color);
+	}
+
+	return "AUTO";
+}
+
+static const char *led_effective_color_label(
+	enum sys_led_color color,
+	bool has_color,
+	bool has_rgb
+)
+{
+	if (has_rgb) {
+		return "RGB";
+	}
+	if (has_color) {
+		return led_color_name(color);
+	}
+
+	return "AUTO";
 }
 
 static const char *led_priority_name(int priority)
@@ -482,6 +540,29 @@ static int led_pwm_period[SYS_LED_COLOR_COUNT][1] = {
 };
 #endif
 
+static struct sys_led_rgb_pptt led_named_color_rgb(enum sys_led_color color)
+{
+#if defined(LED_RGB_COLOR) || defined(LED_TRI_COLOR)
+	return (struct sys_led_rgb_pptt){
+		.r = led_pwm_period[color][0],
+		.g = led_pwm_period[color][1],
+		.b = led_pwm_period[color][2],
+	};
+#elif defined(LED_RG_COLOR) || defined(LED_DUAL_COLOR)
+	return (struct sys_led_rgb_pptt){
+		.r = led_pwm_period[color][0],
+		.g = led_pwm_period[color][1],
+		.b = 0,
+	};
+#else
+	return (struct sys_led_rgb_pptt){
+		.r = led_pwm_period[color][0],
+		.g = led_pwm_period[color][0],
+		.b = led_pwm_period[color][0],
+	};
+#endif
+}
+
 static enum sys_led_color led_effective_color(enum sys_led_color default_color)
 {
 	if (current_led_has_color) {
@@ -495,27 +576,37 @@ static bool led_slot_changed(const struct led_slot *a, const struct led_slot *b)
 {
 	return a->pattern != b->pattern ||
 	       a->has_color != b->has_color ||
-	       (a->has_color && a->color != b->color);
+	       a->has_rgb != b->has_rgb ||
+	       (a->has_color && a->color != b->color) ||
+	       (a->has_rgb && !led_rgb_equal(&a->rgb, &b->rgb));
 }
 
 static bool led_pattern_is_same_effect(
 	enum sys_led_pattern a_pattern,
 	enum sys_led_color a_color,
 	bool a_has_color,
+	struct sys_led_rgb_pptt a_rgb,
+	bool a_has_rgb,
 	enum sys_led_pattern b_pattern,
 	enum sys_led_color b_color,
-	bool b_has_color
+	bool b_has_color,
+	struct sys_led_rgb_pptt b_rgb,
+	bool b_has_rgb
 )
 {
 	return a_pattern == b_pattern &&
 	       a_has_color == b_has_color &&
-	       (!a_has_color || a_color == b_color);
+	       a_has_rgb == b_has_rgb &&
+	       (!a_has_color || a_color == b_color) &&
+	       (!a_has_rgb || led_rgb_equal(&a_rgb, &b_rgb));
 }
 
 static void led_request(
 	enum sys_led_pattern led_pattern,
 	enum sys_led_color color,
 	bool has_color,
+	struct sys_led_rgb_pptt rgb,
+	bool has_rgb,
 	int priority
 )
 {
@@ -524,11 +615,14 @@ static void led_request(
 	enum sys_led_pattern previous_effective = current_led_pattern;
 	enum sys_led_color previous_effective_color = current_led_color;
 	bool previous_effective_has_color = current_led_has_color;
+	bool previous_effective_has_rgb = current_led_has_rgb;
 	int previous_effective_priority = current_priority;
 	int target_priority = priority;
 	struct led_slot previous_slot;
 	enum sys_led_color effective_color = SYS_LED_COLOR_DEFAULT;
+	struct sys_led_rgb_pptt effective_rgb = {0, 0, 0};
 	bool effective_has_color = false;
+	bool effective_has_rgb = false;
 	bool effective_found = false;
 
 	if (led_pattern <= SYS_LED_PATTERN_OFF && k_current_get() == led_thread_id) {
@@ -539,18 +633,23 @@ static void led_request(
 		return;
 	}
 
+	rgb = led_rgb_clamp(rgb);
 	previous_slot = led_slots[target_priority];
 	led_slots[target_priority].pattern = led_pattern;
 	led_slots[target_priority].color = color;
-	led_slots[target_priority].has_color = has_color && led_pattern > SYS_LED_PATTERN_OFF;
+	led_slots[target_priority].rgb = rgb;
+	led_slots[target_priority].has_rgb = has_rgb && led_pattern > SYS_LED_PATTERN_OFF;
+	led_slots[target_priority].has_color = has_color &&
+		!led_slots[target_priority].has_rgb &&
+		led_pattern > SYS_LED_PATTERN_OFF;
 
 	if (led_slot_changed(&previous_slot, &led_slots[target_priority])) {
 		LOG_INF("LED request: slot=%s %s/%s -> %s/%s request=%s/%s caller=%s",
 			led_priority_name(target_priority),
 			led_pattern_name(previous_slot.pattern),
-			previous_slot.has_color ? led_color_name(previous_slot.color) : "AUTO",
+			led_slot_color_label(&previous_slot),
 			led_pattern_name(led_slots[target_priority].pattern),
-			led_slots[target_priority].has_color ? led_color_name(led_slots[target_priority].color) : "AUTO",
+			led_slot_color_label(&led_slots[target_priority]),
 			led_pattern_name(requested_pattern),
 			led_priority_name(requested_priority),
 			led_caller_name());
@@ -563,12 +662,18 @@ static void led_request(
 		led_pattern = led_slots[priority].pattern;
 		effective_color = led_slots[priority].color;
 		effective_has_color = led_slots[priority].has_color;
+		effective_rgb = led_slots[priority].rgb;
+		effective_has_rgb = led_slots[priority].has_rgb;
 		effective_found = true;
 		break;
 	}
 	if (!effective_found) {
 		priority = SYS_LED_PATTERN_DEPTH;
 		led_pattern = SYS_LED_PATTERN_OFF;
+		effective_color = SYS_LED_COLOR_DEFAULT;
+		effective_rgb = (struct sys_led_rgb_pptt){0, 0, 0};
+		effective_has_color = false;
+		effective_has_rgb = false;
 	}
 
 	if (led_pattern > SYS_LED_PATTERN_OFF &&
@@ -576,33 +681,55 @@ static void led_request(
 		    current_led_pattern,
 		    current_led_color,
 		    current_led_has_color,
+		    current_led_rgb,
+		    current_led_has_rgb,
 		    led_pattern,
 		    effective_color,
-		    effective_has_color)) {
+		    effective_has_color,
+		    effective_rgb,
+		    effective_has_rgb)) {
 		current_priority = priority;
 		if (led_slot_changed(&previous_slot, &led_slots[target_priority])) {
 			LOG_INF("LED effective unchanged: %s/%s priority=%s",
 				led_pattern_name(current_led_pattern),
-				current_led_has_color ? led_color_name(current_led_color) : "AUTO",
+				led_effective_color_label(
+					current_led_color,
+					current_led_has_color,
+					current_led_has_rgb
+				),
 				led_priority_name(current_priority));
 		}
 		return;
 	}
 
+	bool pattern_changed = current_led_pattern != led_pattern;
+
 	current_led_pattern = led_pattern;
 	current_priority = priority;
 	current_led_color = effective_color;
 	current_led_has_color = effective_has_color;
-	led_pattern_state = 0;
+	current_led_rgb = effective_rgb;
+	current_led_has_rgb = effective_has_rgb;
+	if (pattern_changed) {
+		led_pattern_state = 0;
+	}
 #ifdef LED_STRIP_EXISTS
 	force_next_strip_update = true;
 #endif
 	LOG_INF("LED effective: %s/%s/%s -> %s/%s/%s",
 		led_pattern_name(previous_effective),
-		previous_effective_has_color ? led_color_name(previous_effective_color) : "AUTO",
+		led_effective_color_label(
+			previous_effective_color,
+			previous_effective_has_color,
+			previous_effective_has_rgb
+		),
 		led_priority_name(previous_effective_priority),
 		led_pattern_name(current_led_pattern),
-		current_led_has_color ? led_color_name(current_led_color) : "AUTO",
+		led_effective_color_label(
+			current_led_color,
+			current_led_has_color,
+			current_led_has_rgb
+		),
 		led_priority_name(current_priority));
 	if (current_led_pattern <= SYS_LED_PATTERN_OFF) {
 		led_suspend();
@@ -628,6 +755,9 @@ static void led_request(
 // TODO: use computed constants for high/low brightness and color values
 static void led_pin_set(enum sys_led_color color, int brightness_pptt, int value_pptt)
 {
+	struct sys_led_rgb_pptt rgb = current_led_has_rgb ? current_led_rgb : led_named_color_rgb(color);
+
+	rgb = led_rgb_clamp(rgb);
 	LOG_DBG("led_pin_set: color %d, brightness %d, global %d, value %d",
 		color, brightness_pptt, CONFIG_LED_GLOBAL_BRIGHTNESS_PPTT, value_pptt);
 	if (brightness_pptt < 0) {
@@ -644,23 +774,41 @@ static void led_pin_set(enum sys_led_color color, int brightness_pptt, int value
 	static struct led_rgb pixel[1];
 	value_pptt = value_pptt * brightness_pptt / 10000;
 	value_pptt = value_pptt * CONFIG_LED_GLOBAL_BRIGHTNESS_PPTT / 10000;
-	pixel[0].r = 255 * (led_pwm_period[color][0] * value_pptt / 10000) / 10000;
-	pixel[0].g = 255 * (led_pwm_period[color][1] * value_pptt / 10000) / 10000;
-	pixel[0].b = 255 * (led_pwm_period[color][2] * value_pptt / 10000) / 10000;
+	pixel[0].r = 255 * (rgb.r * value_pptt / 10000) / 10000;
+	pixel[0].g = 255 * (rgb.g * value_pptt / 10000) / 10000;
+	pixel[0].b = 255 * (rgb.b * value_pptt / 10000) / 10000;
 	(void)led_strip_update_checked(pixel, false);
 #elif PWM_LED_EXISTS
 	value_pptt = value_pptt * brightness_pptt / 10000;
 	value_pptt = value_pptt * CONFIG_LED_GLOBAL_BRIGHTNESS_PPTT / 10000;
 	// only supporting color if PWM is supported
-	pwm_set_pulse_dt(&pwm_led, pwm_led.period / 10000 * (led_pwm_period[color][0] * value_pptt / 10000));
 #if PWM_LED1_EXISTS
-	pwm_set_pulse_dt(&pwm_led1, pwm_led1.period / 10000 * (led_pwm_period[color][1] * value_pptt / 10000));
+	pwm_set_pulse_dt(&pwm_led, pwm_led.period / 10000 * (rgb.r * value_pptt / 10000));
+	pwm_set_pulse_dt(&pwm_led1, pwm_led1.period / 10000 * (rgb.g * value_pptt / 10000));
 #if PWM_LED2_EXISTS
-	pwm_set_pulse_dt(&pwm_led2, pwm_led2.period / 10000 * (led_pwm_period[color][2] * value_pptt / 10000));
-#endif
+	pwm_set_pulse_dt(&pwm_led2, pwm_led2.period / 10000 * (rgb.b * value_pptt / 10000));
 #endif
 #else
-	gpio_pin_set_dt(&led, value_pptt > 5000);
+	int mono_pptt = rgb.r;
+
+	if (rgb.g > mono_pptt) {
+		mono_pptt = rgb.g;
+	}
+	if (rgb.b > mono_pptt) {
+		mono_pptt = rgb.b;
+	}
+	pwm_set_pulse_dt(&pwm_led, pwm_led.period / 10000 * (mono_pptt * value_pptt / 10000));
+#endif
+#else
+	int mono_pptt = rgb.r;
+
+	if (rgb.g > mono_pptt) {
+		mono_pptt = rgb.g;
+	}
+	if (rgb.b > mono_pptt) {
+		mono_pptt = rgb.b;
+	}
+	gpio_pin_set_dt(&led, mono_pptt * value_pptt / 10000 > 5000);
 #endif
 }
 
@@ -687,7 +835,7 @@ void set_led(enum sys_led_pattern led_pattern, int priority)
 	LOG_DBG("set_led: current_led_pattern %d, current_priority %d", current_led_pattern, current_priority);
 	LOG_DBG("set_led: pattern %d, priority %d", led_pattern, priority);
 #if LED_EXISTS || LED_STRIP_EXISTS
-	led_request(led_pattern, SYS_LED_COLOR_DEFAULT, false, priority);
+	led_request(led_pattern, SYS_LED_COLOR_DEFAULT, false, (struct sys_led_rgb_pptt){0, 0, 0}, false, priority);
 #endif
 }
 
@@ -696,7 +844,23 @@ void set_led_color(enum sys_led_pattern led_pattern, enum sys_led_color color, i
 	LOG_DBG("set_led_color: current_led_pattern %d, current_priority %d", current_led_pattern, current_priority);
 	LOG_DBG("set_led_color: pattern %d, color %d, priority %d", led_pattern, color, priority);
 #if LED_EXISTS || LED_STRIP_EXISTS
-	led_request(led_pattern, color, true, priority);
+	led_request(led_pattern, color, true, (struct sys_led_rgb_pptt){0, 0, 0}, false, priority);
+#endif
+}
+
+void set_led_rgb(enum sys_led_pattern led_pattern, struct sys_led_rgb_pptt color, int priority)
+{
+	LOG_DBG("set_led_rgb: current_led_pattern %d, current_priority %d", current_led_pattern, current_priority);
+	LOG_DBG(
+		"set_led_rgb: pattern %d, color %u,%u,%u, priority %d",
+		led_pattern,
+		(unsigned int)color.r,
+		(unsigned int)color.g,
+		(unsigned int)color.b,
+		priority
+	);
+#if LED_EXISTS || LED_STRIP_EXISTS
+	led_request(led_pattern, SYS_LED_COLOR_DEFAULT, false, color, true, priority);
 #endif
 }
 

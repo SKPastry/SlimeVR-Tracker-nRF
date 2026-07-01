@@ -1,6 +1,8 @@
 #ifndef SLIMENRF_SYSTEM_LED
 #define SLIMENRF_SYSTEM_LED
 
+#include <stdint.h>
+
 /*
 LED priorities (0 is highest)
 0: boot/power
@@ -74,7 +76,14 @@ enum sys_led_color {
 	SYS_LED_COLOR_COUNT,
 };
 
+struct sys_led_rgb_pptt {
+	uint16_t r;
+	uint16_t g;
+	uint16_t b;
+};
+
 void set_led(enum sys_led_pattern led_pattern, int priority);
 void set_led_color(enum sys_led_pattern led_pattern, enum sys_led_color color, int priority);
+void set_led_rgb(enum sys_led_pattern led_pattern, struct sys_led_rgb_pptt color, int priority);
 
 #endif

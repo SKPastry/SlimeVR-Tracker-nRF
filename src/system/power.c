@@ -854,7 +854,7 @@ static void power_thread(void)
 			|| battery_low != last_battery_low
 			|| docked != last_docked
 			|| plug_gpio_value != last_plug_gpio_value
-			|| battery_mV_delta >= 50;
+			|| battery_mV_delta >= 100;
 
 		if (power_diag_changed) {
 			LOG_INF(

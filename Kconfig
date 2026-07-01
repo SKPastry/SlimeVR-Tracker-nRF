@@ -476,7 +476,7 @@ config SENSOR_TCAL_HEATED_REQUIRE_PLUGGED
 
 config SENSOR_TCAL_HEATED_DEFAULT_TARGET_C
     int "Heated T-Cal default target temperature (C)"
-    default SENSOR_POLY_TEMP_MAX
+    default 44
     depends on SENSOR_TCAL_HEATED
 
 config SENSOR_TCAL_HEATED_MAX_TEMP_C
