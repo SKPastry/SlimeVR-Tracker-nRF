@@ -72,11 +72,6 @@ K_THREAD_DEFINE(power_thread_id, 1024, power_thread, NULL, NULL, NULL, 6, 0, 0);
 
 #define ZEPHYR_USER_NODE DT_PATH(zephyr_user)
 
-#if DT_NODE_HAS_PROP(ZEPHYR_USER_NODE, plug_gpios)
-#define PLUG_EXISTS true
-static const struct gpio_dt_spec plug_gpio = GPIO_DT_SPEC_GET(ZEPHYR_USER_NODE, plug_gpios);
-#endif
-
 static const char *power_led_pattern_name(enum sys_led_pattern pattern)
 {
 	switch (pattern) {
@@ -691,9 +686,6 @@ static void power_thread(void)
 	static bool watchdog_registered = false;
 	static bool ota_gpregret_logged = false;
 	static bool power_diag_valid = false;
-#ifdef PLUG_EXISTS
-	static bool plug_gpio_configured = false;
-#endif
 	static bool last_charging = false;
 	static bool last_charged = false;
 	static bool last_inferred_plugged = false;
@@ -704,6 +696,7 @@ static void power_thread(void)
 	static int last_battery_mV = 0;
 	static int last_plug_gpio_value = -1;
 	static enum sys_led_pattern last_system_led_pattern = SYS_LED_PATTERN_OFF;
+	static bool last_system_led_success_color = false;
 
 	/* Register power thread with watchdog (watchdog is initialized via SYS_INIT) */
 	if (!watchdog_registered) {
@@ -759,22 +752,8 @@ static void power_thread(void)
 		bool docked = dock_read();
 		bool charging = chg_read();
 		bool charged = stby_read();
-		int plug_gpio_value = -1;
-#ifdef PLUG_EXISTS
-		if (!plug_gpio_configured) {
-			int rc = -1;
-
-			if (device_is_ready(plug_gpio.port)) {
-				rc = gpio_pin_configure_dt(&plug_gpio, GPIO_INPUT);
-			}
-			plug_gpio_configured = true;
-			LOG_INF("Power diag: plug GPIO configure rc=%d ready=%d",
-				rc, device_is_ready(plug_gpio.port));
-		}
-		if (device_is_ready(plug_gpio.port)) {
-			plug_gpio_value = gpio_pin_get_dt(&plug_gpio);
-		}
-#endif
+		bool plug_gpio_active = plug_read();
+		int plug_gpio_value = plug_gpio_active;
 
 		int battery_mV;
 		int16_t battery_pptt = read_batt_mV(&battery_mV);
@@ -795,14 +774,14 @@ static void power_thread(void)
 		bool usb_plugged = false;
 #endif
 		int64_t now_ms = k_uptime_get();
-		bool raw_device_plugged = charging || charged || plugged || usb_plugged;
+		bool raw_device_plugged = plug_gpio_active || charging || charged || plugged || usb_plugged;
 		bool plug_state_debouncing = update_device_plugged_state(raw_device_plugged, now_ms);
 		bool plug_signal_settling = plug_state_debouncing
 			|| now_ms - last_plug_signal_change_ms < BATTERY_PLUG_SETTLE_MS;
 		bool battery_discharged = !plug_signal_settling && battery_available
 			&& (average_pptt >= 0 ? average_pptt : battery_pptt) == 0;
 
-		device_charged = charged; // TODO: timer on device_plugged could be used to infer charged state
+		device_charged = charged || (plug_gpio_active && !charging);
 
 		if (!power_init)
 		{
@@ -898,16 +877,19 @@ static void power_thread(void)
 
 		enum sys_led_pattern system_led_pattern;
 		const char *system_led_reason;
+		bool system_led_success_color = false;
 
 		if (charging) {
 			system_led_pattern = SYS_LED_PATTERN_PULSE_PERSIST;
 			system_led_reason = "charging";
-		} else if (charged) {
-			system_led_pattern = SYS_LED_PATTERN_ON_PERSIST;
-			system_led_reason = "charged";
-		} else if (plugged || usb_plugged) {
+		} else if (device_charged) {
 			system_led_pattern = SYS_LED_PATTERN_PULSE_PERSIST;
-			system_led_reason = plugged ? "inferred-plugged" : "usb-plugged";
+			system_led_success_color = true;
+			system_led_reason = charged ? "charged" : "plug-inferred-charged";
+		} else if (plug_gpio_active || plugged || usb_plugged) {
+			system_led_pattern = SYS_LED_PATTERN_PULSE_PERSIST;
+			system_led_reason = plug_gpio_active ? "plug-gpio" :
+				(plugged ? "inferred-plugged" : "usb-plugged");
 		} else if (battery_low) {
 			system_led_pattern = SYS_LED_PATTERN_LONG_PERSIST;
 			system_led_reason = "battery-low";
@@ -916,11 +898,16 @@ static void power_thread(void)
 			system_led_reason = "active";
 		}
 
-		if (!power_diag_valid || system_led_pattern != last_system_led_pattern) {
+		if (!power_diag_valid || system_led_pattern != last_system_led_pattern
+			|| system_led_success_color != last_system_led_success_color) {
 			LOG_INF("Power LED decision: %s reason=%s",
 				power_led_pattern_name(system_led_pattern), system_led_reason);
 		}
-		set_led(system_led_pattern, SYS_LED_PRIORITY_SYSTEM);
+		if (system_led_success_color) {
+			set_led_color(system_led_pattern, SYS_LED_COLOR_SUCCESS, SYS_LED_PRIORITY_SYSTEM);
+		} else {
+			set_led(system_led_pattern, SYS_LED_PRIORITY_SYSTEM);
+		}
 //			set_led(SYS_LED_PATTERN_OFF, SYS_LED_PRIORITY_SYSTEM);
 
 		power_diag_valid = true;
@@ -934,6 +921,7 @@ static void power_thread(void)
 		last_battery_mV = battery_mV;
 		last_plug_gpio_value = plug_gpio_value;
 		last_system_led_pattern = system_led_pattern;
+		last_system_led_success_color = system_led_success_color;
 
 		/* Feed watchdog at end of each loop iteration */
 		watchdog_feed(WDT_CHANNEL_POWER);

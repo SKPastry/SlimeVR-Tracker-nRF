@@ -49,6 +49,12 @@ K_THREAD_DEFINE(
 #define ZEPHYR_USER_NODE DT_PATH(zephyr_user)
 #define CLKOUT_NODE DT_NODELABEL(pwmclock)
 
+#if DT_NODE_HAS_PROP(ZEPHYR_USER_NODE, plug_gpios)
+#define PLUG_EXISTS true
+static const struct gpio_dt_spec plug = GPIO_DT_SPEC_GET(ZEPHYR_USER_NODE, plug_gpios);
+#else
+#pragma message "Plug sense GPIO does not exist"
+#endif
 #if DT_NODE_HAS_PROP(ZEPHYR_USER_NODE, dock_gpios)
 #define DOCK_EXISTS true
 static const struct gpio_dt_spec dock = GPIO_DT_SPEC_GET(ZEPHYR_USER_NODE, dock_gpios);
@@ -517,6 +523,9 @@ static void button_thread(void)
 
 static int sys_gpio_init(void)
 {
+#if PLUG_EXISTS
+	gpio_pin_configure_dt(&plug, GPIO_INPUT);
+#endif
 #if DOCK_EXISTS // configure if exists
 	gpio_pin_configure_dt(&dock, GPIO_INPUT);
 #endif
@@ -544,6 +553,15 @@ bool dock_read(void)
 {
 #if DOCK_EXISTS
 	return gpio_pin_get_dt(&dock);
+#else
+	return false;
+#endif
+}
+
+bool plug_read(void)
+{
+#if PLUG_EXISTS
+	return gpio_pin_get_dt(&plug);
 #else
 	return false;
 #endif

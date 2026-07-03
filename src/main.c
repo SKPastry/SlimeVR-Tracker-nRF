@@ -155,14 +155,32 @@ int main(void)
 #if USER_SHUTDOWN_ENABLED
 	bool charging = chg_read();
 	bool charged = stby_read();
-	LOG_INF("Main: startup power check before vin_read chg=%d stby=%d", charging, charged);
+	bool plug_gpio_active = plug_read();
+	LOG_INF("Main: startup power check before vin_read chg=%d stby=%d plug_gpio=%d",
+		charging, charged, plug_gpio_active);
 	bool plugged = vin_read();
-	LOG_INF("Main: startup power state chg=%d stby=%d plugged=%d",
-		charging, charged, plugged);
+	bool usb_plugged = vbus_read();
+	bool externally_powered = plug_gpio_active || charging || charged || plugged || usb_plugged;
+	bool fully_charged = charged || (plug_gpio_active && !charging);
+	LOG_INF("Main: startup power state chg=%d stby=%d plug_gpio=%d plugged=%d usb=%d external=%d full=%d",
+		charging, charged, plug_gpio_active, plugged, usb_plugged, externally_powered, fully_charged);
 
-	if (reset_mode == 0 && !booting_from_shutdown && !charging && !charged
-		&& !plugged) { // Reset mode user shutdown, only if unplugged and undocked
+	if (reset_mode == 0 && !booting_from_shutdown && !externally_powered) {
+		// Reset mode user shutdown, only if unplugged and undocked.
 		sys_user_shutdown();
+	}
+
+	if (externally_powered) {
+		if (fully_charged) {
+			set_led_color(
+				SYS_LED_PATTERN_PULSE_PERSIST,
+				SYS_LED_COLOR_SUCCESS,
+				SYS_LED_PRIORITY_SYSTEM
+			);
+		} else {
+			set_led(SYS_LED_PATTERN_PULSE_PERSIST, SYS_LED_PRIORITY_SYSTEM);
+		}
+		set_led(SYS_LED_PATTERN_OFF, SYS_LED_PRIORITY_HIGHEST);
 	}
 #endif
 

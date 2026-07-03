@@ -54,6 +54,7 @@ int set_sensor_clock(bool enable, float rate, float* actual_rate);
 bool button_read(void);
 
 bool dock_read(void);
+bool plug_read(void);
 bool chg_read(void);
 bool stby_read(void);
 
