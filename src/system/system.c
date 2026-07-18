@@ -14,6 +14,7 @@
 #include <zephyr/storage/flash_map.h>
 #include <zephyr/fs/nvs.h>
 #include <hal/nrf_gpio.h>
+#include <math.h>
 
 #include "system.h"
 #include "battery_tracker.h"
@@ -44,6 +45,13 @@ K_THREAD_DEFINE(
 ); // TODO: stack increased because of reboot request (to 512) and sensor scan (to 1024)
 #else
 #pragma message "Button GPIO does not exist"
+#endif
+
+#if defined(CONFIG_BOARD_SK_CHEESECAKE_NRF_P00) && CONFIG_SENSOR_TCAL_HEATED && \
+	DT_NODE_HAS_PROP(DT_ALIAS(sw1), gpios)
+#define TCAL_BUTTON_EXISTS true
+#define TCAL_BUTTON_DEBOUNCE_MS 50
+#define TCAL_BUTTON_HOLD_MS 3000
 #endif
 
 #define ZEPHYR_USER_NODE DT_PATH(zephyr_user)
@@ -402,6 +410,15 @@ static const struct gpio_dt_spec button0 = GPIO_DT_SPEC_GET(DT_ALIAS(sw0), gpios
 static int64_t press_time = 0;
 static int64_t last_press_duration = 0;
 
+#if TCAL_BUTTON_EXISTS
+static const struct gpio_dt_spec tcal_button = GPIO_DT_SPEC_GET(DT_ALIAS(sw1), gpios);
+static bool tcal_button_raw_state;
+static bool tcal_button_pressed;
+static bool tcal_button_action_handled;
+static int64_t tcal_button_raw_change_time;
+static int64_t tcal_button_press_time;
+#endif
+
 static void button_interrupt_handler(const struct device *dev, struct gpio_callback *cb, uint32_t pins)
 {
 	bool pressed = button_read();
@@ -422,6 +439,14 @@ static int sys_button_init(void)
 	gpio_pin_interrupt_configure_dt(&button0, GPIO_INT_EDGE_BOTH);
 	gpio_init_callback(&button_cb_data, button_interrupt_handler, BIT(button0.pin));
 	gpio_add_callback(button0.port, &button_cb_data);
+
+#if TCAL_BUTTON_EXISTS
+	int err = gpio_pin_configure_dt(&tcal_button, GPIO_INPUT);
+	if (err) {
+		LOG_ERR("Heated T-Cal button configuration failed (err=%d)", err);
+		return err;
+	}
+#endif
 	return 0;
 }
 
@@ -438,6 +463,57 @@ bool button_read(void)
 }
 
 #if BUTTON_EXISTS // Alternate button if available to use as "reset key"
+#if TCAL_BUTTON_EXISTS
+static void tcal_button_process(bool ota_busy)
+{
+	int value = gpio_pin_get_dt(&tcal_button);
+	if (value < 0) {
+		return;
+	}
+
+	int64_t now = k_uptime_get();
+	bool raw_state = value != 0;
+
+	if (raw_state != tcal_button_raw_state) {
+		tcal_button_raw_state = raw_state;
+		tcal_button_raw_change_time = now;
+	}
+
+	if (tcal_button_raw_state != tcal_button_pressed &&
+	    now - tcal_button_raw_change_time >= TCAL_BUTTON_DEBOUNCE_MS) {
+		tcal_button_pressed = tcal_button_raw_state;
+		tcal_button_action_handled = false;
+		tcal_button_press_time = tcal_button_pressed ? now : 0;
+	}
+
+	if (!tcal_button_pressed || tcal_button_action_handled ||
+	    now - tcal_button_press_time < TCAL_BUTTON_HOLD_MS) {
+		return;
+	}
+
+	/* Require a release before another action, including blocked/failed starts. */
+	tcal_button_action_handled = true;
+
+	if (ota_busy) {
+		LOG_INF("Heated T-Cal button hold blocked by OTA");
+		set_led(SYS_LED_PATTERN_ONESHOT_PROGRESS, SYS_LED_PRIORITY_HIGHEST);
+		return;
+	}
+
+	if (sensor_tcal_heated_is_active()) {
+		LOG_INF("Heated T-Cal button hold ignored: calibration already active");
+		return;
+	}
+
+	int err = sensor_tcal_heated_start(NAN);
+	if (err) {
+		LOG_WRN("Heated T-Cal button start failed (err=%d)", err);
+	} else {
+		LOG_INF("Heated T-Cal started by button hold");
+	}
+}
+#endif
+
 static void button_thread(void)
 {
 	int num_presses = 0;
@@ -467,6 +543,9 @@ static void button_thread(void)
 		}
 		/* Block all button actions during OTA (active or suppressed) */
 		bool ota_busy = esb_ota_is_active() || connection_get_ota_suppressed();
+#if TCAL_BUTTON_EXISTS
+		tcal_button_process(ota_busy);
+#endif
 		if (last_press && k_uptime_get() - last_press > 1000) {
 			LOG_INF("Button was pressed %d times", num_presses);
 			last_press = 0;

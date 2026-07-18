@@ -65,6 +65,10 @@ static const struct device *gpio_dev = DEVICE_DT_GET(DT_NODELABEL(gpio0));
 #endif
 
 #define CONSOLE_BUTTON_EXISTS DT_NODE_HAS_PROP(DT_ALIAS(sw0), gpios)
+#if defined(CONFIG_BOARD_SK_CHEESECAKE_NRF_P00) && CONFIG_SENSOR_TCAL_HEATED && \
+	DT_NODE_HAS_PROP(DT_ALIAS(sw1), gpios)
+#define CONSOLE_TCAL_BUTTON_EXISTS true
+#endif
 
 static const char *meows[] = {
 	"Mew", "Meww", "Meow", "Meow meow", "Mrrrp", "Mrrf", "Mreow", "Mrrrow", "Mrrr", "Purr",
@@ -502,6 +506,10 @@ static void print_button_help(void)
 #endif
 #if USB_EXISTS && DFU_EXISTS
 	printk("  Hold while USB connects:   Enter DFU bootloader\n");
+#endif
+#if CONSOLE_TCAL_BUTTON_EXISTS
+	printk("  User button 2 hold (~3s):  Start Heated T-Cal (default %d C)\n",
+	       CONFIG_SENSOR_TCAL_HEATED_DEFAULT_TARGET_C);
 #endif
 	printk("  During OTA:                Button actions are blocked\n");
 #else
