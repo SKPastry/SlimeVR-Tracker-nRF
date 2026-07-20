@@ -249,6 +249,41 @@ config ACTIVE_TIMEOUT_DELAY
     help
         Activity timeout duration when triggered.
 
+config DYNAMIC_ACTIVE_TIMEOUT
+    bool "Adapt activity timeout after wake-on-motion"
+    default y
+    depends on USE_ACTIVE_TIMEOUT && SLEEP_ON_ACTIVE_TIMEOUT
+    help
+        Shorten the activity timeout after low-activity wake-on-motion cycles.
+        Meaningful activity restores ACTIVE_TIMEOUT_DELAY.
+
+config ACTIVE_TIMEOUT_IDLE_WAKE_DELAY
+    int "Low-activity wake timeout (ms)"
+    default 90000
+    range 1000 3600000
+    depends on DYNAMIC_ACTIVE_TIMEOUT
+
+config ACTIVE_TIMEOUT_REPEAT_WAKE_DELAY
+    int "Repeated low-activity wake timeout (ms)"
+    default 60000
+    range 1000 3600000
+    depends on DYNAMIC_ACTIVE_TIMEOUT
+
+config ACTIVE_TIMEOUT_REPEAT_WAKE_COUNT
+    int "Low-activity wakes before shortest timeout"
+    default 2
+    range 1 255
+    depends on DYNAMIC_ACTIVE_TIMEOUT
+
+config ACTIVE_TIMEOUT_MEANINGFUL_MOTION_MS
+    int "Weighted motion score needed to restore normal timeout"
+    default 25000
+    range 1000 600000
+    depends on DYNAMIC_ACTIVE_TIMEOUT
+    help
+        Integer motion score threshold. Strong motion adds three points per
+        millisecond, moderate motion adds one, and weak motion subtracts one.
+
 config DISABLE_SENSOR_GPIOS_ON_SHUTDOWN
     bool "Disable Sensor GPIOs on shutdown"
     default y
@@ -334,15 +369,8 @@ config SENSOR_MAG_ODR
     default 200
     help
         Requested magnetometer output data rate in Hz.
+        Fixed at magnetometer init for the session (nearest supported continuous rate).
         Common values: 100, 200. Higher rates may not be supported by all sensors.
-
-config SENSOR_MAG_FIXED_ODR
-    bool "Use fixed magnetometer ODR"
-    default y
-    help
-        If enabled, use a fixed magnetometer ODR instead of dynamic adjustment.
-        This ensures VQF fusion receives consistent timing information.
-        When disabled, ODR is dynamically adjusted based on gyroscope speed.
 
 choice
 	prompt "Sensor fusion"
@@ -660,6 +688,8 @@ config CLOCK_CONTROL_NRF_K32SRC_RC_CALIBRATION
     bool "Enable RC oscillator calibration for K32SRC"
     default y if CLOCK_USE_LF_SYNTH && CONNECTION_TDMA
     default n
+
+rsource "Kconfig.sensors_drivers"
 
 source "Kconfig.zephyr"
 
