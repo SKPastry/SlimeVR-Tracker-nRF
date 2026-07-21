@@ -32,6 +32,7 @@
 #include "calibration/calibration.h"
 #include "calibration/mag_common.h"
 #include "motion_state.h"
+#include "zephyr/logging/log.h"
 
 #include <errno.h>
 #include <math.h>
@@ -192,12 +193,32 @@ static float mag_actual_time;
 
 static uint8_t sensor_fifo_raw_buffer[SENSOR_FIFO_RAW_BUFFER_SIZE];
 
+/*
+ * Runtime INT_merge factor. Defaults to CONFIG_SENSOR_GYRO_OVERSAMPLING.
+ * On I2C IMU, forced to 1 and chip ODR is requested at the intended fusion
+ * rate (ODR/N) — 400 kHz I2C cannot sustain hi-res FIFO at 1600 Hz.
+ */
+static uint8_t gyro_oversample_n = CONFIG_SENSOR_GYRO_OVERSAMPLING;
+
 #if CONFIG_SENSOR_GYRO_OVERSAMPLING > 1
-// Gyroscope oversampling state for noise reduction
-// Accumulates gyro samples and averages them before fusion
-static float gyro_oversample_sum[3] = {0};
+/*
+ * INT_merge: high-rate Δq product → one fusion gyro step at ODR/N.
+ *
+ * Two bias layers (do not mix):
+ *  1) Firmware: process_gyro (TCal / static gyroBias / D_offset) + sens scale
+ *     applied per sample into `g` before merge.
+ *  2) Fusion: VQF/EqF residual bias, frozen for the N-sample window, subtracted
+ *     when building each Δq, then re-added on the fed ω_eq so update_gyro's
+ *     internal subtract recovers the debiased equivalent rate.
+ * Never re-add firmware offsets on the feed path — fusion never sees them.
+ */
+/* float enough: N≤16 near-identity Δq; Cortex-M4/M33 FPU is SP-only */
+#define GYRO_DQ_EPS 1e-8f
+#define GYRO_DQ_HALF_TAYLOR 1e-4f /* |θ/2| below this → sinc/cos Taylor */
+static float gyro_dq_acc[4];
 static int gyro_oversample_count = 0;
-static float gyro_effective_time; // Effective time step for fusion after oversampling
+static float gyro_effective_time; /* N * gyro_actual_time */
+static float gyro_merge_bias_dps[3]; /* frozen fusion bias for one window */
 #endif
 
 #if CONFIG_SENSOR_ACCEL_OVERSAMPLING > 1
@@ -210,6 +231,25 @@ static float accel_effective_time; // Effective time step for fusion after overs
 
 static float accel_actual_range; // Actual accelerometer full scale range (g)
 static float gyro_actual_range;  // Actual gyroscope full scale range (deg/s)
+
+/* Raw gyrQuat emit plan: same N as fusion INT_merge, separate uncalibrated accum. */
+struct raw_rate_plan {
+	uint8_t n_raw; /* == gyro_oversample_n */
+	uint8_t emit_count;
+	float chip_hz;
+	float send_hz; /* == fusion_hz; meta gyro_odr (host gyrTs) */
+	float fusion_hz;
+};
+
+static struct raw_rate_plan raw_rate_plan = {
+	.n_raw = 1,
+	.emit_count = 0,
+	.chip_hz = 0.0f,
+	.send_hz = 0.0f,
+	.fusion_hz = 0.0f,
+};
+
+static void sensor_send_raw_metadata(void);
 
 static float sensor_actual_time;
 static int16_t sensor_fifo_threshold;
@@ -329,14 +369,16 @@ static const sensor_imu_t *sensor_imu = &sensor_imu_none;
 static const sensor_mag_t *sensor_mag = &sensor_mag_none;
 
 #if CONFIG_SENSOR_USE_TCAL
-// Temperature used by T-Cal (°C).
-// Low-pass filtered to reduce IMU temperature sensor noise which can cause compensation jitter.
+/* Single LPF: τ=500ms without active curve, τ=100ms when LUT/MLS apply ready. */
 #ifndef SENSOR_TCAL_TEMP_FILTER_TAU_MS
-#define SENSOR_TCAL_TEMP_FILTER_TAU_MS 500 // ms
+#define SENSOR_TCAL_TEMP_FILTER_TAU_MS 500 // ms — ZRO / collect / display
+#endif
+#ifndef SENSOR_TCAL_TEMP_CURVE_TAU_MS
+#define SENSOR_TCAL_TEMP_CURVE_TAU_MS 100 // ms — when curve compensation active
 #endif
 
-static float sensor_tcal_temp = 25.0f;     // Filtered temperature (°C)
-static float sensor_tcal_temp_raw = 25.0f; // Last raw temperature reading (°C)
+static float sensor_tcal_temp = 25.0f;
+static float sensor_tcal_temp_raw = 25.0f;
 static bool sensor_tcal_temp_filter_initialized = false;
 static int64_t sensor_tcal_temp_filter_last_ms = 0;
 #endif
@@ -1224,15 +1266,7 @@ void sensor_set_mag_enabled(bool enabled)
 	sensor_refresh_sensor_ids();
 
 	if (connection_get_data_collection()) {
-		connection_send_raw_metadata(
-			gyro_actual_range,
-			accel_actual_range,
-			1.0f / gyro_actual_time,
-			1.0f / accel_actual_time,
-			mag_available && mag_enabled ? 1.0f / mag_actual_time : 0.0f,
-			(uint8_t)sensor_imu_id,
-			(uint8_t)sensor_mag_id
-		);
+		sensor_send_raw_metadata();
 	}
 
 	main_imu_resume();
@@ -1505,8 +1539,26 @@ int sensor_init(void)
 
 	// setup sensor, set ODR
 	float accel_initial_time = 1.0f / CONFIG_SENSOR_ACCEL_ODR; // configure with accel ODR from config
-	float gyro_initial_time = 1.0f / CONFIG_SENSOR_GYRO_ODR;   // configure with gyro ODR from config
 	float mag_initial_time = 1.0f / CONFIG_SENSOR_MAG_ODR;     // configure with mag ODR from config
+	/*
+	 * Gyro request: SPI keeps CONFIG ODR + INT_merge N.
+	 * I2C: bus cannot drain hi-res FIFO at high ODR — drop merge, request
+	 * the intended fusion rate (ODR/N) so chip Hz ≈ fusion Hz.
+	 */
+	gyro_oversample_n = CONFIG_SENSOR_GYRO_OVERSAMPLING;
+	float gyro_request_hz = (float)CONFIG_SENSOR_GYRO_ODR;
+	if (sensor_interface_imu_is_i2c() && CONFIG_SENSOR_GYRO_OVERSAMPLING > 1) {
+		gyro_oversample_n = 1;
+		gyro_request_hz
+			= (float)CONFIG_SENSOR_GYRO_ODR / (float)CONFIG_SENSOR_GYRO_OVERSAMPLING;
+		LOG_INF(
+			"I2C IMU: gyro request %.0fHz (fusion target), oversampling off (config %dx @ %dHz)",
+			(double)gyro_request_hz,
+			CONFIG_SENSOR_GYRO_OVERSAMPLING,
+			CONFIG_SENSOR_GYRO_ODR
+		);
+	}
+	float gyro_initial_time = 1.0f / gyro_request_hz;
 	err = sensor_imu
 			  ->init(clock_actual_rate, accel_initial_time, gyro_initial_time, &accel_actual_time, &gyro_actual_time);
 	sensor_actual_time = MIN(accel_actual_time, gyro_actual_time);
@@ -1538,18 +1590,21 @@ int sensor_init(void)
 	LOG_INF("Initialized sensors");
 
 #if CONFIG_SENSOR_GYRO_OVERSAMPLING > 1
-	// Initialize gyro oversampling state
+	gyro_dq_acc[0] = 1.0f;
+	gyro_dq_acc[1] = 0.0f;
+	gyro_dq_acc[2] = 0.0f;
+	gyro_dq_acc[3] = 0.0f;
 	gyro_oversample_count = 0;
-	for (int i = 0; i < 3; i++) {
-		gyro_oversample_sum[i] = 0;
+	gyro_merge_bias_dps[0] = gyro_merge_bias_dps[1] = gyro_merge_bias_dps[2] = 0.0f;
+	gyro_effective_time = gyro_actual_time * (float)gyro_oversample_n;
+	if (gyro_oversample_n > 1) {
+		LOG_INF(
+			"Gyro INT_merge: %dx Δq @ %.2fHz → fusion %.2fHz (firmware cal per sample; fusion bias frozen/window)",
+			gyro_oversample_n,
+			1.0 / (double)gyro_actual_time,
+			1.0 / (double)gyro_effective_time
+		);
 	}
-	// Calculate effective time step for fusion after oversampling
-	gyro_effective_time = gyro_actual_time * CONFIG_SENSOR_GYRO_OVERSAMPLING;
-	LOG_INF(
-		"Gyro oversampling: %dx, effective rate: %.2fHz",
-		CONFIG_SENSOR_GYRO_OVERSAMPLING,
-		1.0 / (double)gyro_effective_time
-	);
 #endif
 
 #if CONFIG_SENSOR_ACCEL_OVERSAMPLING > 1
@@ -1582,7 +1637,7 @@ int sensor_init(void)
 	} else {
 		// Determine effective gyro time step for fusion
 #if CONFIG_SENSOR_GYRO_OVERSAMPLING > 1
-		float fusion_gyro_time = gyro_effective_time;
+		float fusion_gyro_time = (gyro_oversample_n > 1) ? gyro_effective_time : gyro_actual_time;
 #else
 		float fusion_gyro_time = gyro_actual_time;
 #endif
@@ -1647,21 +1702,14 @@ int sensor_init(void)
 	// last_mag_fusion_ticks reset is sufficient; no extra state to clear.
 
 	if (connection_get_data_collection()) {
-		connection_send_raw_metadata(
-			gyro_actual_range,
-			accel_actual_range,
-			1.0f / gyro_actual_time,
-			1.0f / accel_actual_time,
-			mag_available && mag_enabled ? 1.0f / mag_actual_time : 0.0f,
-			(uint8_t)sensor_imu_id,
-			(uint8_t)sensor_mag_id
-		);
+		sensor_send_raw_metadata();
 		connection_send_raw_calibration();
 		LOG_INF(
-			"Data collection mode: metadata + calibration sent (gyro %.0fdps, accel %.0fg, gyro ODR %.0fHz)",
+			"Data collection mode: metadata + calibration sent (gyro %.0fdps, accel %.0fg, send %.0fHz, chip %.0fHz)",
 			(double)gyro_actual_range,
 			(double)accel_actual_range,
-			1.0 / (double)gyro_actual_time
+			(double)raw_rate_plan.send_hz,
+			(double)raw_rate_plan.chip_hz
 		);
 	}
 
@@ -1673,6 +1721,7 @@ int sensor_init(void)
 
 static int64_t last_status_time = 0;
 static int64_t max_loop_time = 0;
+static float loop_period_ema_ms; /* ~actual publish/loop period */
 
 static bool last_data_collection_state = false;
 
@@ -1680,6 +1729,33 @@ static bool last_data_collection_state = false;
  * Integrates raw gyro (no bias correction) so offline VQF can re-estimate bias.
  * Reset when data collection starts. */
 static float raw_gyr_quat[4] = {1.0f, 0.0f, 0.0f, 0.0f};
+
+static void raw_rate_plan_refresh(void)
+{
+	float chip_hz = 1.0f / gyro_actual_time;
+	uint8_t n_raw = gyro_oversample_n > 0 ? gyro_oversample_n : 1;
+
+	raw_rate_plan.n_raw = n_raw;
+	raw_rate_plan.chip_hz = chip_hz;
+	raw_rate_plan.fusion_hz = chip_hz / (float)n_raw;
+	raw_rate_plan.send_hz = raw_rate_plan.fusion_hz;
+}
+
+static void sensor_send_raw_metadata(void)
+{
+	raw_rate_plan_refresh();
+	connection_send_raw_metadata(
+		gyro_actual_range,
+		accel_actual_range,
+		raw_rate_plan.send_hz,
+		1.0f / accel_actual_time,
+		mag_available && mag_enabled ? 1.0f / mag_actual_time : 0.0f,
+		(uint8_t)sensor_imu_id,
+		(uint8_t)sensor_mag_id,
+		raw_rate_plan.chip_hz,
+		raw_rate_plan.fusion_hz
+	);
+}
 
 #if DEBUG
 static int64_t last_acquisition_time = INT64_MAX;
@@ -1693,6 +1769,7 @@ static uint64_t total_loop_iterations = 0;
 #endif
 // Count actual mag samples fed to VQF since last status report (always tracked)
 static uint32_t mag_vqf_updates_since_status = 0;
+static float mag_feed_hz; /* last STATUS_INTERVAL window */
 
 /*
  * After a calibration change, fusion reset_mag_ref() zeros the backend magRef.
@@ -1795,6 +1872,7 @@ typedef struct {
 /* Persistent per-frame average accel (kept when a_count == 0). */
 static float sensor_loop_avg_a[3] = {0};
 
+#if CONFIG_SENSOR_GYRO_OVERSAMPLING <= 1
 static void feed_calibrated_gyro(float *g, float dt, int *g_count, float *debug_cal_g_sum)
 {
 	// Accumulate calibrated gyro for debug (after zero bias and sensitivity calibration)
@@ -1815,9 +1893,10 @@ static void feed_calibrated_gyro(float *g, float dt, int *g_count, float *debug_
 	sensor_fusion->update_gyro(g, dt);
 	(*g_count)++;
 }
+#endif /* CONFIG_SENSOR_GYRO_OVERSAMPLING <= 1 */
 
-#if (CONFIG_SENSOR_GYRO_OVERSAMPLING > 1) || (CONFIG_SENSOR_ACCEL_OVERSAMPLING > 1)
-/* Shared accumulate + average for gyro/accel oversampling (CMSIS or scalar). */
+#if CONFIG_SENSOR_ACCEL_OVERSAMPLING > 1
+/* Accel oversampling: average samples (noise reduction; not orientation strapdown). */
 static void oversample_accum3(float sum[3], const float sample[3])
 {
 #if CONFIG_CMSIS_DSP
@@ -1851,6 +1930,107 @@ static bool oversample_try_avg3(float sum[3], int *count, int n, float out_avg[3
 }
 #endif
 
+#if CONFIG_SENSOR_GYRO_OVERSAMPLING > 1
+static void gyro_dq_mul(const float q1[4], const float q2[4], float out[4])
+{
+	float w = q1[0] * q2[0] - q1[1] * q2[1] - q1[2] * q2[2] - q1[3] * q2[3];
+	float x = q1[0] * q2[1] + q1[1] * q2[0] + q1[2] * q2[3] - q1[3] * q2[2];
+	float y = q1[0] * q2[2] - q1[1] * q2[3] + q1[2] * q2[0] + q1[3] * q2[1];
+	float z = q1[0] * q2[3] + q1[1] * q2[2] - q1[2] * q2[1] + q1[3] * q2[0];
+	out[0] = w;
+	out[1] = x;
+	out[2] = y;
+	out[3] = z;
+}
+
+/*
+ * g_dps: firmware-compensated; fusion_bias_dps: frozen fusion residual.
+ * float + small-angle Taylor + soft renormalize (same Δq form as VQF).
+ */
+static void gyro_dq_accumulate_sample(const float g_dps[3], const float fusion_bias_dps[3], float dt)
+{
+	float wx = (g_dps[0] - fusion_bias_dps[0]) * DEG_TO_RAD;
+	float wy = (g_dps[1] - fusion_bias_dps[1]) * DEG_TO_RAD;
+	float wz = (g_dps[2] - fusion_bias_dps[2]) * DEG_TO_RAD;
+	float wn2 = wx * wx + wy * wy + wz * wz;
+	float dq[4];
+	if (wn2 > GYRO_DQ_EPS) {
+		float wn = sqrtf(wn2);
+		float half = 0.5f * wn * dt;
+		float c;
+		float s; /* sin(half)/wn == (dt/2)*sinc(half) */
+		if (half < GYRO_DQ_HALF_TAYLOR) {
+			float h2 = half * half;
+			c = 1.0f - 0.5f * h2 * (1.0f - h2 / 12.0f);
+			s = 0.5f * dt * (1.0f - h2 / 6.0f * (1.0f - h2 / 20.0f));
+		} else {
+			c = cosf(half);
+			s = sinf(half) / wn;
+		}
+		dq[0] = c;
+		dq[1] = s * wx;
+		dq[2] = s * wy;
+		dq[3] = s * wz;
+	} else {
+		dq[0] = 1.0f;
+		dq[1] = 0.0f;
+		dq[2] = 0.0f;
+		dq[3] = 0.0f;
+	}
+	float out[4];
+	gyro_dq_mul(gyro_dq_acc, dq, out);
+	/* Soft renormalize: q ← q*(1.5 - 0.5|q|²). */
+	float n2 = out[0] * out[0] + out[1] * out[1] + out[2] * out[2] + out[3] * out[3];
+	float scale = 1.5f - 0.5f * n2;
+	gyro_dq_acc[0] = out[0] * scale;
+	gyro_dq_acc[1] = out[1] * scale;
+	gyro_dq_acc[2] = out[2] * scale;
+	gyro_dq_acc[3] = out[3] * scale;
+}
+
+/*
+ * Merged Δq → ω_eq; re-add frozen fusion bias.
+ * atan2(|v|,w) > acos(w) for small windows.
+ */
+static void gyro_dq_to_feed_gyro(float g_feed_dps[3], float T_eff, const float fusion_bias_dps[3])
+{
+	float qw = gyro_dq_acc[0];
+	float qx = gyro_dq_acc[1];
+	float qy = gyro_dq_acc[2];
+	float qz = gyro_dq_acc[3];
+	if (qw < 0.0f) {
+		qw = -qw;
+		qx = -qx;
+		qy = -qy;
+		qz = -qz;
+	}
+	float vnorm = sqrtf(qx * qx + qy * qy + qz * qz);
+	float angle = 2.0f * atan2f(vnorm, qw);
+	float wr[3];
+	if (vnorm > GYRO_DQ_EPS && angle > GYRO_DQ_EPS) {
+		float half = 0.5f * angle;
+		float scale;
+		if (half < GYRO_DQ_HALF_TAYLOR) {
+			float h2 = half * half;
+			scale = (2.0f * (1.0f + h2 / 6.0f)) / T_eff;
+		} else {
+			scale = angle / (sinf(half) * T_eff);
+		}
+		wr[0] = qx * scale;
+		wr[1] = qy * scale;
+		wr[2] = qz * scale;
+	} else {
+		float scale = 2.0f / T_eff;
+		wr[0] = qx * scale;
+		wr[1] = qy * scale;
+		wr[2] = qz * scale;
+	}
+	g_feed_dps[0] = wr[0] * RAD_TO_DEG + fusion_bias_dps[0];
+	g_feed_dps[1] = wr[1] * RAD_TO_DEG + fusion_bias_dps[1];
+	g_feed_dps[2] = wr[2] * RAD_TO_DEG + fusion_bias_dps[2];
+}
+#endif
+
 static void feed_gyro_sample(
 	float *raw_g,
 	int *g_count,
@@ -1876,30 +2056,12 @@ static void feed_gyro_sample(
 		(*debug_g_samples)++;
 	}
 
-#if CONFIG_SENSOR_GYRO_OVERSAMPLING > 1
-	/* Accumulate raw before cal; linear cal/sens so order is equivalent and cheaper. */
-	oversample_accum3(gyro_oversample_sum, raw_g);
-	float g_avg[3];
-	if (!oversample_try_avg3(gyro_oversample_sum, &gyro_oversample_count, CONFIG_SENSOR_GYRO_OVERSAMPLING, g_avg)) {
-		return;
-	}
-
-	sensor_calibration_process_gyro(g_avg);
-
-#if CONFIG_SENSOR_USE_SENS_CALIBRATION
-	if (retained) {
-		g_avg[0] *= retained->gyroSensScale[0];
-		g_avg[1] *= retained->gyroSensScale[1];
-		g_avg[2] *= retained->gyroSensScale[2];
-	}
-#endif
-
-	feed_calibrated_gyro(g_avg, gyro_effective_time, g_count, debug_cal_g_sum);
-#else
+	/* --- Firmware compensation (layer 1): TCal / static ZRO / D_offset --- */
 	sensor_calibration_process_gyro(raw_g);
 	float g[] = {raw_g[0], raw_g[1], raw_g[2]};
 
 #if CONFIG_SENSOR_USE_SENS_CALIBRATION
+	/* Firmware-ish scale; applied before fusion, same as non-OS path. */
 	if (retained) {
 		g[0] *= retained->gyroSensScale[0];
 		g[1] *= retained->gyroSensScale[1];
@@ -1907,6 +2069,44 @@ static void feed_gyro_sample(
 	}
 #endif
 
+#if CONFIG_SENSOR_GYRO_OVERSAMPLING > 1
+	/* Per-sample stats on firmware-compensated g; Δq merge; one fusion step. */
+	if (sensor_debug_is_active()) {
+		for (int j = 0; j < 3; j++) {
+			debug_cal_g_sum[j] += g[j];
+		}
+	}
+#if CONFIG_SENSOR_RANGE_STATS
+	sensor_update_range_stats_gyro(g);
+#endif
+	sensor_record_rest_gyro_motion(g);
+
+	/* Freeze fusion residual bias for the whole window (layer 2). */
+	if (gyro_oversample_count == 0) {
+		if (sensor_fusion && sensor_fusion->get_gyro_bias) {
+			sensor_fusion->get_gyro_bias(gyro_merge_bias_dps);
+		} else {
+			gyro_merge_bias_dps[0] = gyro_merge_bias_dps[1] = gyro_merge_bias_dps[2] = 0.0f;
+		}
+	}
+	gyro_dq_accumulate_sample(g, gyro_merge_bias_dps, gyro_actual_time);
+	gyro_oversample_count++;
+	if (gyro_oversample_count < (int)gyro_oversample_n) {
+		return;
+	}
+
+	float g_feed[3];
+	gyro_dq_to_feed_gyro(g_feed, gyro_effective_time, gyro_merge_bias_dps);
+	/* g_feed is post-firmware + fusion_bias carrier; update_gyro subtracts fusion bias. */
+	sensor_fusion->update_gyro(g_feed, gyro_effective_time);
+	(*g_count)++;
+
+	gyro_dq_acc[0] = 1.0f;
+	gyro_dq_acc[1] = 0.0f;
+	gyro_dq_acc[2] = 0.0f;
+	gyro_dq_acc[3] = 0.0f;
+	gyro_oversample_count = 0;
+#else
 	feed_calibrated_gyro(g, gyro_actual_time, g_count, debug_cal_g_sum);
 #endif
 }
@@ -1976,32 +2176,22 @@ static void sensor_loop_handle_data_collection(bool *dc_active)
 	*dc_active = connection_get_data_collection();
 	if (*dc_active && !last_data_collection_state) {
 		sys_interface_resume();
-		/* Reset raw gyro quaternion accumulator */
+		/* Reset raw gyro quaternion accumulator and emit counter */
 		raw_gyr_quat[0] = 1.0f;
 		raw_gyr_quat[1] = 0.0f;
 		raw_gyr_quat[2] = 0.0f;
 		raw_gyr_quat[3] = 0.0f;
-		connection_send_raw_metadata(
-			gyro_actual_range,
-			accel_actual_range,
-			1.0f / gyro_actual_time,
-			1.0f / accel_actual_time,
-			mag_available && mag_enabled ? 1.0f / mag_actual_time : 0.0f,
-			(uint8_t)sensor_imu_id,
-			(uint8_t)sensor_mag_id
-		);
+		raw_rate_plan.emit_count = 0;
+		sensor_send_raw_metadata();
 		connection_send_raw_calibration();
-		LOG_INF("Data collection activated: metadata + calibration sent");
-	} else if (*dc_active && connection_raw_metadata_resend_due()) {
-		connection_send_raw_metadata(
-			gyro_actual_range,
-			accel_actual_range,
-			1.0f / gyro_actual_time,
-			1.0f / accel_actual_time,
-			mag_available && mag_enabled ? 1.0f / mag_actual_time : 0.0f,
-			(uint8_t)sensor_imu_id,
-			(uint8_t)sensor_mag_id
+		LOG_INF(
+			"Data collection activated: send %.0fHz n_raw=%u chip %.0fHz",
+			(double)raw_rate_plan.send_hz,
+			raw_rate_plan.n_raw,
+			(double)raw_rate_plan.chip_hz
 		);
+	} else if (*dc_active && connection_raw_metadata_resend_due()) {
+		sensor_send_raw_metadata();
 		connection_send_raw_calibration();
 	}
 	last_data_collection_state = *dc_active;
@@ -2056,29 +2246,27 @@ static void sensor_loop_acquire(sensor_loop_frame_t *frame)
 		// Keep last raw value for debugging/telemetry if needed
 		sensor_tcal_temp_raw = temp;
 
-		// Low-pass filter the temperature to reduce compensation jitter.
-		// First valid reading initializes the filter to avoid startup lag.
 		if (!sensor_tcal_temp_filter_initialized) {
 			sensor_tcal_temp = temp;
 			sensor_tcal_temp_filter_initialized = true;
 		} else {
 			int64_t dt_ms = now_ms - sensor_tcal_temp_filter_last_ms;
-			// If the last update was a long time ago (e.g. after suspend), re-sync immediately.
 			if (dt_ms < 0 || dt_ms > 10000) {
 				sensor_tcal_temp = temp;
 			} else {
-				// Avoid dt=0 freezing the filter when multiple loops occur within the same ms.
 				if (dt_ms == 0) {
 					dt_ms = 1;
 				}
 				float dt = (float)dt_ms;
-				float alpha = dt / ((float)SENSOR_TCAL_TEMP_FILTER_TAU_MS + dt);
+				unsigned int tau_ms = sensor_tcal_curve_apply_ready()
+									  ? SENSOR_TCAL_TEMP_CURVE_TAU_MS
+									  : SENSOR_TCAL_TEMP_FILTER_TAU_MS;
+				float alpha = dt / ((float)tau_ms + dt);
 				sensor_tcal_temp = sensor_tcal_temp + alpha * (temp - sensor_tcal_temp);
 			}
 		}
 		sensor_tcal_temp_filter_last_ms = now_ms;
 
-		// Report filtered temp to keep host display consistent with compensation
 		connection_update_sensor_temp(sensor_tcal_temp);
 	}
 #else
@@ -2198,14 +2386,10 @@ static void sensor_loop_process_fifo(sensor_loop_frame_t *frame)
 		 * duplicate entries from separate accel/gyro FIFO tags.
 		 * Pair with the latest accel sample if present; otherwise zeros. */
 		if (raw_g[0] != 0 || raw_g[1] != 0 || raw_g[2] != 0) {
-			struct raw_imu_sample raw_sample;
 			if (frame->dc_active) {
-				/* Integrate raw gyro into quaternion accumulator.
-				 * raw_g is in deg/s; convert to rad/s for integration. */
+				/* Integrate every chip sample; queue only every n_raw samples. */
 				float g_rad[3]
-					= {raw_g[0] * (float)(M_PI / 180.0f),
-					   raw_g[1] * (float)(M_PI / 180.0f),
-					   raw_g[2] * (float)(M_PI / 180.0f)};
+					= {raw_g[0] * DEG_TO_RAD, raw_g[1] * DEG_TO_RAD, raw_g[2] * DEG_TO_RAD};
 				float gyr_norm = sqrtf(g_rad[0] * g_rad[0] + g_rad[1] * g_rad[1] + g_rad[2] * g_rad[2]);
 				if (gyr_norm > 1e-6f) {
 					float angle = gyr_norm * gyro_actual_time;
@@ -2228,12 +2412,20 @@ static void sensor_loop_process_fifo(sensor_loop_frame_t *frame)
 					raw_gyr_quat[3] = q3 * inv_norm;
 				}
 
-				memcpy(raw_sample.gyr_quat, raw_gyr_quat, sizeof(raw_sample.gyr_quat));
-				memcpy(raw_sample.accel, raw_collect_a, sizeof(raw_sample.accel));
-				raw_sample.temp_c = frame->raw_collect_temp_c;
-				connection_queue_raw_sample(&raw_sample);
+				raw_rate_plan.emit_count++;
+				if (raw_rate_plan.emit_count >= raw_rate_plan.n_raw) {
+					struct raw_imu_sample raw_sample;
+					raw_rate_plan.emit_count = 0;
+					memcpy(raw_sample.gyr_quat, raw_gyr_quat, sizeof(raw_sample.gyr_quat));
+					memcpy(raw_sample.accel, raw_collect_a, sizeof(raw_sample.accel));
+					raw_sample.temp_c = frame->raw_collect_temp_c;
+					connection_queue_raw_sample(&raw_sample);
+					/* Clear only on emit so mid-window accel tags stay latched. */
+					memset(raw_collect_a, 0, sizeof(raw_collect_a));
+				}
+			} else {
+				memset(raw_collect_a, 0, sizeof(raw_collect_a));
 			}
-			memset(raw_collect_a, 0, sizeof(raw_collect_a));
 		}
 
 		// Debug: Log gyro values to see if they're all zero
@@ -2400,18 +2592,16 @@ static void sensor_loop_check_packets(sensor_loop_frame_t *frame, int64_t time_b
 		float expected_accel_samples = sensor_update_time_ms / 1000.0f / accel_actual_time;
 
 #if CONFIG_SENSOR_GYRO_OVERSAMPLING > 1
-		// With gyro oversampling, expected fusion timesteps is reduced by oversampling factor
-		float expected_gyro_timesteps_f = expected_gyro_samples / CONFIG_SENSOR_GYRO_OVERSAMPLING;
-		// Only warn if actual count is significantly off (more than ±50% or at least ±1)
-		// This handles fractional expected values better
+		/* Δq-merge: one fusion gyro step per N high-rate samples (N may be 1 on I2C). */
+		float expected_gyro_timesteps_f = expected_gyro_samples / (float)gyro_oversample_n;
 		if (frame->g_count) {
 			int min_expected = (int)expected_gyro_timesteps_f;           // floor
 			int max_expected = (int)(expected_gyro_timesteps_f + 0.99f); // ceiling
 			if (frame->g_count < min_expected - 1 || frame->g_count > max_expected + 1) {
 				LOG_DBG(
-					"Expected ~%.1f gyro timesteps (oversampling %dx), got %d (elapsed %lldms)",
+					"Expected ~%.1f gyro timesteps (Δq-merge %dx), got %d (elapsed %lldms)",
 					(double)expected_gyro_timesteps_f,
-					CONFIG_SENSOR_GYRO_OVERSAMPLING,
+					gyro_oversample_n,
 					frame->g_count,
 					elapsed_ms
 				);
@@ -2781,6 +2971,15 @@ static void sensor_loop_wait(int64_t time_begin)
 	sensor_life_mark_idle();
 	int64_t time_delta = k_uptime_get() - time_begin;
 
+	if (time_delta > 0) {
+		float delta_ms = (float)time_delta;
+		if (loop_period_ema_ms <= 0.0f) {
+			loop_period_ema_ms = delta_ms;
+		} else {
+			loop_period_ema_ms = 0.9f * loop_period_ema_ms + 0.1f * delta_ms;
+		}
+	}
+
 	if (time_delta > sensor_update_time_ms && time_delta > max_loop_time) {
 		max_loop_time = time_delta;
 	}
@@ -2792,17 +2991,20 @@ static void sensor_loop_wait(int64_t time_begin)
 			max_loop_time = 0;
 		}
 		if (mag_available && mag_enabled) {
+			mag_feed_hz = mag_vqf_updates_since_status * 1000.0f / (float)STATUS_INTERVAL_MS;
 			// Report actual rate of mag samples fed into VQF (target: mag ODR, e.g. 50Hz)
 			if (sensor_debug_is_active()) {
 				LOG_INF(
 					"mag VQF updates: %u in last %dms (%.1fHz, target %.0fHz)",
 					mag_vqf_updates_since_status,
 					STATUS_INTERVAL_MS,
-					(double)mag_vqf_updates_since_status * 1000.0 / STATUS_INTERVAL_MS,
+					(double)mag_feed_hz,
 					1.0 / (double)mag_actual_time
 				);
 			}
 			mag_vqf_updates_since_status = 0;
+		} else {
+			mag_feed_hz = 0.0f;
 		}
 #if DEBUG
 		LOG_DBG(
@@ -2845,7 +3047,7 @@ static void sensor_loop_wait(int64_t time_begin)
 		}
 	} else // if signal was sent during processing, loop immediately to catch up
 	{
-		LOG_INF("FIFO THS/WM/WTM triggered during loop");
+		LOG_DBG("FIFO THS/WM/WTM triggered during loop");
 		k_yield();
 		main_wfi = false;
 	}
@@ -2962,7 +3164,7 @@ void main_imu_restart(void)
 	{
 		// Determine effective gyro time step for fusion (must match sensor_init logic)
 #if CONFIG_SENSOR_GYRO_OVERSAMPLING > 1
-		float fusion_gyro_time = gyro_effective_time;
+		float fusion_gyro_time = (gyro_oversample_n > 1) ? gyro_effective_time : gyro_actual_time;
 #else
 		float fusion_gyro_time = gyro_actual_time;
 #endif
@@ -2989,11 +3191,8 @@ void main_imu_restart(void)
 }
 
 #if CONFIG_SENSOR_USE_TCAL
-// Public function to get the current IMU temperature
 float sensor_get_current_imu_temperature(void)
 {
-	// If the filter hasn't been initialized yet, fall back to the last raw reading.
-	// This avoids returning the default 25C for a short window at startup.
 	return sensor_tcal_temp_filter_initialized ? sensor_tcal_temp : sensor_tcal_temp_raw;
 }
 
@@ -3034,6 +3233,45 @@ float sensor_get_gyro_odr(void)
 		return 1.0f / gyro_actual_time;
 	}
 	return (float)CONFIG_SENSOR_GYRO_ODR; // Fallback to config value
+}
+
+float sensor_get_mag_odr(void)
+{
+	if (!mag_available) {
+		return 0.0f;
+	}
+	/* Prefer driver period; some update_odr paths leave INFINITY. */
+	if (mag_actual_time > 0.0f && mag_actual_time < 1.0f) {
+		return 1.0f / mag_actual_time;
+	}
+	/* Kconfig fallback only after mag has been brought up. */
+	if (mag_enabled) {
+		return (float)CONFIG_SENSOR_MAG_ODR;
+	}
+	return 0.0f;
+}
+
+float sensor_get_mag_feed_hz(void)
+{
+	if (!mag_available || !mag_enabled) {
+		return 0.0f;
+	}
+	return mag_feed_hz;
+}
+
+float sensor_get_fusion_rate(void)
+{
+#if CONFIG_SENSOR_GYRO_OVERSAMPLING > 1
+	if (gyro_oversample_n > 1 && gyro_effective_time > 0.0f) {
+		return 1.0f / gyro_effective_time;
+	}
+#endif
+	return sensor_get_gyro_odr();
+}
+
+float sensor_get_loop_period_ms(void)
+{
+	return loop_period_ema_ms;
 }
 
 // Debug mode control functions

@@ -22,6 +22,7 @@
 */
 #include "globals.h"
 #include "sensor/sensor.h"
+#include "sensor/calibration/calibration.h"
 #include "connection.h"
 #include "util.h"
 #include "esb.h"
@@ -546,8 +547,19 @@ static int64_t last_runtime_time = 0;
  * Sensor thread queues raw IMU/mag samples via message queues.
  * Connection thread drains them and sends ESB packets with floats.
  *
- * ESB Raw IMU + GyrQuat packet (type 0x13, 52 bytes):
- *   [0]    type 0x13
+ * ESB raw meta (ESB_RAW_META_TYPE, RAW_PACKET_SIZE):
+ *   [2-5]   gyro_range
+ *   [6-9]   accel_range
+ *   [10-13] gyro_odr / raw TX Hz (equals fusion INT_merge rate; host gyrTs)
+ *   [14-17] accel_odr
+ *   [18-21] mag_odr
+ *   [22]    imu_id
+ *   [23]    mag_id
+ *   [24-27] chip_gyro_hz
+ *   [28-31] fusion_gyro_hz (0 = omit)
+ *
+ * ESB raw IMU + gyrQuat (ESB_RAW_IMU_QUAT_TYPE, RAW_PACKET_SIZE):
+ *   [0]    packet type
  *   [1]    tracker_id
  *   [2-3]  sequence (16-bit BE)
  *   [4-19] gyr_quat w,x,y,z (float × 4, accumulated raw integration)
@@ -580,7 +592,7 @@ static int64_t ota_suppress_start_time = 0;  /* Timestamp when suppress was enab
  * Indexed by (sequence % RAW_RING_SIZE).
  */
 #define RAW_RING_SIZE 256
-#define RAW_PACKET_SIZE 52 /* Fixed raw data packet size (type 0x13 with gyrQuat) */
+#define RAW_PACKET_SIZE 52 /* Fixed size for raw meta / gyrQuat / cal payloads */
 static uint8_t raw_ring[RAW_RING_SIZE][RAW_PACKET_SIZE];
 static bool raw_ring_valid[RAW_RING_SIZE];
 static uint16_t raw_ring_seq[RAW_RING_SIZE];
@@ -762,22 +774,27 @@ void connection_send_raw_metadata(
 	float accel_odr,
 	float mag_odr,
 	uint8_t imu,
-	uint8_t mag
+	uint8_t mag,
+	float chip_gyro_hz,
+	float fusion_gyro_hz
 )
 {
 	/* Buffer metadata for deferred sending by connection thread.
 	 * Never call esb_write() from sensor thread — avoids
-	 * cross-thread ESB TX FIFO contention with raw data flow. */
+	 * cross-thread ESB TX FIFO contention with raw data flow.
+	 * TX uses full RAW_PACKET_SIZE so chip/fusion Hz trailer stays on the wire. */
 	memset(raw_metadata_buf, 0, sizeof(raw_metadata_buf));
 	raw_metadata_buf[0] = ESB_RAW_META_TYPE;
 	raw_metadata_buf[1] = tracker_id;
 	memcpy(&raw_metadata_buf[2], &gyro_range, 4);
 	memcpy(&raw_metadata_buf[6], &accel_range, 4);
-	memcpy(&raw_metadata_buf[10], &gyro_odr, 4);
+	memcpy(&raw_metadata_buf[10], &gyro_odr, 4); /* raw TX Hz (= fusion rate) */
 	memcpy(&raw_metadata_buf[14], &accel_odr, 4);
 	memcpy(&raw_metadata_buf[18], &mag_odr, 4);
 	raw_metadata_buf[22] = imu;
 	raw_metadata_buf[23] = mag;
+	memcpy(&raw_metadata_buf[24], &chip_gyro_hz, 4);
+	memcpy(&raw_metadata_buf[28], &fusion_gyro_hz, 4);
 
 	raw_metadata_pending = true;
 	/* Reset 60s resend timer now so sensor loop won't re-trigger
@@ -845,14 +862,36 @@ static bool connection_cal_drip_send(void)
 #if CONFIG_SENSOR_USE_TCAL
 	case 3: { /* T-Cal state */
 		buf[2] = RAW_CAL_SUB_TCAL;
-		buf[3] = retained->tcal_enabled ? 1 : 0;
+		/*
+		 * buf[3] flags (compat: non-zero ⇒ compensation flag on):
+		 *   bit0 = tcal_enabled
+		 *   bit1 = curve actively applied (enough points)
+		 *   bit2 = enabled but ZRO fallback (insufficient points)
+		 */
+		uint8_t tcal_flags = 0;
+		if (retained->tcal_enabled) {
+			tcal_flags |= 0x01;
+		}
+		switch (sensor_tcal_get_apply_mode()) {
+		case SENSOR_TCAL_APPLY_CURVE:
+			tcal_flags |= 0x02;
+			break;
+		case SENSOR_TCAL_APPLY_ZRO_FALLBACK:
+			tcal_flags |= 0x04;
+			break;
+		default:
+			break;
+		}
+		buf[3] = tcal_flags;
 		uint16_t npoints = connection_tcal_valid_point_count();
 		memcpy(&buf[4], &npoints, 2);
 		float temp_min = (float)CONFIG_SENSOR_POLY_TEMP_MIN;
 		float temp_max = (float)CONFIG_SENSOR_POLY_TEMP_MAX;
 		memcpy(&buf[6], &temp_min, 4);
 		memcpy(&buf[10], &temp_max, 4);
-		memcpy(&buf[14], retained->tempCalCorrectionOffset, 12);
+		/* [14]: apply mode enum; rest of former correction-offset area zeroed */
+		memset(&buf[14], 0, 12);
+		buf[14] = (uint8_t)sensor_tcal_get_apply_mode();
 		esb_write(buf, false, RAW_PACKET_SIZE);
 		if (npoints > 0) {
 			raw_cal_phase = 4;
@@ -1268,7 +1307,7 @@ void connection_thread(void)
 			if (esb_ota_is_active()) {
 				esb_ota_check_timeout();
 				esb_ota_periodic_status();
-				k_msleep(2);
+				k_usleep(1500);
 				continue;
 			}
 
