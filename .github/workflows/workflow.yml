@@ -7,7 +7,7 @@ on:
     branches:
       - main
       - dev
-      - dev-*
+      - devc
       - "feat/**"
     tags:
       - "*"
