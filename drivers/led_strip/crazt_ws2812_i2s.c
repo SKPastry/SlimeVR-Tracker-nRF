@@ -80,6 +80,37 @@ static void ws2812_i2s_recover(const struct ws2812_i2s_cfg *cfg)
 	(void)i2s_trigger(cfg->dev, I2S_DIR_TX, I2S_TRIGGER_DROP);
 }
 
+static int ws2812_i2s_acquire_tx_buffer(const struct ws2812_i2s_cfg *cfg, void **mem_block)
+{
+	void *barrier_block = NULL;
+	int ret;
+
+	*mem_block = NULL;
+
+	ret = k_mem_slab_alloc(cfg->mem_slab, mem_block, K_SECONDS(10));
+	if (ret < 0) {
+		LOG_DBG("Unable to allocate mem slab for TX (err %d)", ret);
+		return -ENOMEM;
+	}
+
+	/*
+	 * DRAIN completes asynchronously. Taking both private TX blocks waits for
+	 * a previous frame to be released; nrfx enters READY before releasing it.
+	 * Return the barrier block immediately and keep the payload block reserved.
+	 */
+	ret = k_mem_slab_alloc(cfg->mem_slab, &barrier_block, K_SECONDS(10));
+	if (ret < 0) {
+		k_mem_slab_free(cfg->mem_slab, *mem_block);
+		*mem_block = NULL;
+		LOG_DBG("Unable to allocate mem slab for TX (err %d)", ret);
+		return -ENOMEM;
+	}
+
+	k_mem_slab_free(cfg->mem_slab, barrier_block);
+
+	return 0;
+}
+
 static int ws2812_i2s_fill_buffer(const struct ws2812_i2s_cfg *cfg, struct led_rgb *pixels,
 				  size_t num_pixels, void **mem_block)
 {
@@ -90,10 +121,9 @@ static int ws2812_i2s_fill_buffer(const struct ws2812_i2s_cfg *cfg, struct led_r
 	int ret;
 
 	/* Acquire memory for the I2S payload. */
-	ret = k_mem_slab_alloc(cfg->mem_slab, mem_block, K_SECONDS(10));
+	ret = ws2812_i2s_acquire_tx_buffer(cfg, mem_block);
 	if (ret < 0) {
-		LOG_DBG("Unable to allocate mem slab for TX (err %d)", ret);
-		return -ENOMEM;
+		return ret;
 	}
 	tx_buf = (uint32_t *)*mem_block;
 
@@ -168,7 +198,10 @@ static int ws2812_i2s_transfer(const struct ws2812_i2s_cfg *cfg, void *mem_block
 		return ret;
 	}
 
-	/* Wait until transaction is over */
+	/*
+	 * Preserve the normal wire-time delay. The next dual-block acquisition
+	 * provides the cross-frame completion barrier.
+	 */
 	flush_time_us = cfg->lrck_period * cfg->tx_buf_bytes / sizeof(uint32_t);
 	k_usleep(flush_time_us + cfg->extra_wait_time_us);
 
