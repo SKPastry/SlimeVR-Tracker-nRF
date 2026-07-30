@@ -105,6 +105,16 @@ static const struct device *gpio_dev = DEVICE_DT_GET(DT_NODELABEL(gpio0));
 #define CONSOLE_TCAL_BUTTON_EXISTS true
 #endif
 
+#if CONFIG_SENSOR_TCAL_HEATED
+static const char tcal_heat_usage[]
+	= "tcal heat <start [temp] | stop | status | duty <pptt> | tune <kp|ki|kff> <value>>";
+
+static void print_tcal_heat_usage(void)
+{
+	printk("Usage: %s\n", tcal_heat_usage);
+}
+#endif
+
 static const char *meows[] = {
 	"Mew", "Meww", "Meow", "Meow meow", "Mrrrp", "Mrrf", "Mreow", "Mrrrow", "Mrrr", "Purr",
 	"mew", "meww", "meow", "meow meow", "mrrrp", "mrrf", "mreow", "mrrrow", "mrrr", "purr",
@@ -667,7 +677,7 @@ static void print_help(void)
 	// Update the help string to show the new command set
 	printk("  tcal <on|off|status|dump|test temp|remove index|auto on|auto off> Temperature calibration\n");
 #if CONFIG_SENSOR_TCAL_HEATED
-	printk("  tcal heat <start [temp]|stop|status|duty pptt|tune kp|ki|kff value> Heated T-Cal\n");
+	printk("  %s Heated T-Cal\n", tcal_heat_usage);
 #endif
 #endif
 	printk("\n");
@@ -1086,10 +1096,8 @@ static void console_cmd_tcal(size_t argc, char **argv)
 					char *endptr = NULL;
 					target_temp = strtof(target_str, &endptr);
 					if (endptr == target_str || *endptr != '\0') {
-						printk(
-							"Error: Invalid target temperature '%s'. Use: tcal heat start [temp]\n",
-							target_str
-						);
+						printk("Error: Invalid target temperature '%s'.\n", target_str);
+						print_tcal_heat_usage();
 						return;
 					}
 				}
@@ -1100,18 +1108,29 @@ static void console_cmd_tcal(size_t argc, char **argv)
 					printk("Heated T-Cal started.\n");
 				}
 			} else if (strcmp(heat_arg, "stop") == 0) {
-				sensor_tcal_heated_stop();
-				printk("Heated T-Cal stopped.\n");
+				if (!sensor_tcal_heated_is_active()) {
+					printk("Heated T-Cal is not active.\n");
+				} else {
+					sensor_tcal_heated_stop();
+					printk("Heated T-Cal stopped.\n");
+				}
 			} else if (strcmp(heat_arg, "duty") == 0) {
 				char *duty_str = argc > 3 ? argv[3] : NULL;
 				if (duty_str == NULL) {
-					printk("Error: Missing duty. Use: tcal heat duty <pptt>\n");
+					printk("Error: Missing duty.\n");
+					print_tcal_heat_usage();
 					return;
 				}
 				char *endptr = NULL;
 				long duty = strtol(duty_str, &endptr, 10);
-				if (endptr == duty_str || *endptr != '\0' || duty < 0 || duty > 10000) {
-					printk("Error: Invalid duty '%s'. Use 0..10000 pptt.\n", duty_str);
+				if (endptr == duty_str || *endptr != '\0' || duty < 0 ||
+				    duty > CONFIG_SYSTEM_IMU_HEATER_MAX_DUTY_PPTT) {
+					printk(
+						"Error: Invalid duty '%s'. Use 0..%d pptt.\n",
+						duty_str,
+						CONFIG_SYSTEM_IMU_HEATER_MAX_DUTY_PPTT
+					);
+					print_tcal_heat_usage();
 					return;
 				}
 				int err = sensor_tcal_heated_set_open_loop_duty((uint16_t)duty);
@@ -1124,26 +1143,27 @@ static void console_cmd_tcal(size_t argc, char **argv)
 				char *param = argc > 3 ? argv[3] : NULL;
 				char *value_str = argc > 4 ? argv[4] : NULL;
 				if (param == NULL || value_str == NULL) {
-					printk("Error: Use: tcal heat tune <kp|ki|kff> <value>\n");
+					printk("Error: Missing tune parameter or value.\n");
+					print_tcal_heat_usage();
 					return;
 				}
 				char *endptr = NULL;
 				float value = strtof(value_str, &endptr);
 				if (endptr == value_str || *endptr != '\0') {
 					printk("Error: Invalid tune value '%s'.\n", value_str);
+					print_tcal_heat_usage();
 					return;
 				}
 				int err = sensor_tcal_heated_tune(param, value);
 				if (err) {
 					printk("Error: Heated T-Cal tune failed (%d).\n", err);
+					print_tcal_heat_usage();
 				} else {
 					printk("Heated T-Cal tune updated: %s = %.4f\n", param, (double)value);
 				}
 			} else {
-				printk(
-					"Error: Invalid heat command '%s'. Use: tcal heat <start [temp]|stop|status|duty pptt|tune kp|ki|kff value>\n",
-					heat_arg
-				);
+				printk("Error: Invalid heat command '%s'.\n", heat_arg);
+				print_tcal_heat_usage();
 			}
 #else
 		} else if (strcmp(subcmd, "heat") == 0) {

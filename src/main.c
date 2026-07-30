@@ -79,14 +79,14 @@ int main(void)
 #endif
 #endif
 
-	LOG_INF("Main: boot LED on");
 	set_led(SYS_LED_PATTERN_ON, SYS_LED_PRIORITY_BOOT); // Boot LED
 
 	uint8_t reboot_counter = reboot_counter_read();
+	bool button_pressed = button_read();
 	bool booting_from_shutdown
-		= !reboot_counter && (reset_pin_reset || button_read()); // 0 means from user shutdown or failed ram validation
-	LOG_INF("Main: reset_pin_reset=%d button=%d reboot_counter=%u booting_from_shutdown=%d",
-		reset_pin_reset, button_read(), reboot_counter, booting_from_shutdown);
+		= !reboot_counter && (reset_pin_reset || button_pressed); // 0 means from user shutdown or failed ram validation
+	LOG_DBG("Main: reset_pin_reset=%d button=%d reboot_counter=%u booting_from_shutdown=%d",
+		reset_pin_reset, button_pressed, reboot_counter, booting_from_shutdown);
 
 	/* if button is not held after booting from shutdown, power off again
 	 * if button press is normal, continue boot
@@ -156,13 +156,11 @@ int main(void)
 	bool charging = chg_read();
 	bool charged = stby_read();
 	bool plug_gpio_active = plug_read();
-	LOG_INF("Main: startup power check before vin_read chg=%d stby=%d plug_gpio=%d",
-		charging, charged, plug_gpio_active);
 	bool plugged = vin_read();
 	bool usb_plugged = vbus_read();
 	bool externally_powered = plug_gpio_active || charging || charged || plugged || usb_plugged;
 	bool fully_charged = charged || (plug_gpio_active && !charging);
-	LOG_INF("Main: startup power state chg=%d stby=%d plug_gpio=%d plugged=%d usb=%d external=%d full=%d",
+	LOG_DBG("Main: startup power state chg=%d stby=%d plug_gpio=%d plugged=%d usb=%d external=%d full=%d",
 		charging, charged, plug_gpio_active, plugged, usb_plugged, externally_powered, fully_charged);
 
 	if (reset_mode == 0 && !booting_from_shutdown && !externally_powered) {
@@ -186,7 +184,6 @@ int main(void)
 
 	if (!booting_from_shutdown) { // ONESHOT_POWERON automatically sets LED off
 		k_usleep(60);
-		LOG_INF("Main: clearing boot LED");
 		set_led(SYS_LED_PATTERN_OFF, SYS_LED_PRIORITY_BOOT);
 	}
 

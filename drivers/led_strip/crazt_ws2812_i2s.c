@@ -50,7 +50,6 @@ struct ws2812_i2s_cfg {
 
 struct ws2812_i2s_data {
 	struct k_mutex lock;
-	int64_t last_error_log_ms;
 };
 
 /* Serialize an 8-bit color channel value into two 16-bit I2S values (or 1 32-bit
@@ -93,7 +92,7 @@ static int ws2812_i2s_fill_buffer(const struct ws2812_i2s_cfg *cfg, struct led_r
 	/* Acquire memory for the I2S payload. */
 	ret = k_mem_slab_alloc(cfg->mem_slab, mem_block, K_SECONDS(10));
 	if (ret < 0) {
-		LOG_ERR("Unable to allocate mem slab for TX (err %d)", ret);
+		LOG_DBG("Unable to allocate mem slab for TX (err %d)", ret);
 		return -ENOMEM;
 	}
 	tx_buf = (uint32_t *)*mem_block;
@@ -205,15 +204,6 @@ static int ws2812_strip_update_rgb(const struct device *dev, struct led_rgb *pix
 		ws2812_i2s_recover(cfg);
 	}
 
-	if (ret < 0) {
-		int64_t now = k_uptime_get();
-
-		if (now - data->last_error_log_ms >= 1000) {
-			data->last_error_log_ms = now;
-			LOG_ERR("I2S update failed after retry: %d", ret);
-		}
-	}
-
 	if (mem_block != NULL) {
 		k_mem_slab_free(cfg->mem_slab, mem_block);
 	}
@@ -255,7 +245,7 @@ static int ws2812_i2s_init(const struct device *dev)
 
 	ret = i2s_configure(cfg->dev, I2S_DIR_TX, &config);
 	if (ret < 0) {
-		LOG_ERR("Failed to configure I2S device: %d\n", ret);
+		LOG_ERR("Failed to configure I2S device: %d", ret);
 		return ret;
 	}
 

@@ -349,24 +349,28 @@ static void tcal_save_point(int idx, const float bias[3], float measured_temp)
 			ema_alpha = TCAL_HYSTERESIS_EMA_UNKNOWN;
 			break;
 		}
-		LOG_INF(
-			"T-Cal: Blending at idx %d (dir: %s, alpha: %.2f)",
-			idx,
-			tcal_current_direction == TCAL_DIR_RISING    ? "rising"
-			: tcal_current_direction == TCAL_DIR_FALLING ? "falling"
-														 : "unknown",
-			(double)ema_alpha
-		);
+		if (!tcal_save_defer_nvs) {
+			LOG_INF(
+				"T-Cal: Blending at idx %d (dir: %s, alpha: %.2f)",
+				idx,
+				tcal_current_direction == TCAL_DIR_RISING    ? "rising"
+				: tcal_current_direction == TCAL_DIR_FALLING ? "falling"
+															 : "unknown",
+				(double)ema_alpha
+			);
+		}
 		for (int axis = 0; axis < 3; axis++) {
 			final_bias[axis]
 				= ema_alpha * final_bias[axis] + (1.0f - ema_alpha) * retained->tempCalPoints[idx].bias[axis];
 		}
-		LOG_INF(
-			"T-Cal: Blended bias: %.5f %.5f %.5f",
-			(double)final_bias[0],
-			(double)final_bias[1],
-			(double)final_bias[2]
-		);
+		if (!tcal_save_defer_nvs) {
+			LOG_INF(
+				"T-Cal: Blended bias: %.5f %.5f %.5f",
+				(double)final_bias[0],
+				(double)final_bias[1],
+				(double)final_bias[2]
+			);
+		}
 	} else {
 		retained->tempCalState.count++;
 	}
@@ -385,15 +389,17 @@ static void tcal_save_point(int idx, const float bias[3], float measured_temp)
 	memcpy(retained->tempCalPoints[idx].bias, final_bias, sizeof(float) * 3);
 	retained->tempCalState.valid = false;
 
-	LOG_INF(
-		"T-Cal: Committed point at idx %d (%.2fC): [%.5f, %.5f, %.5f] (delta: %.4f dps)",
-		idx,
-		(double)measured_temp,
-		(double)final_bias[0],
-		(double)final_bias[1],
-		(double)final_bias[2],
-		(double)max_delta
-	);
+	if (!tcal_save_defer_nvs) {
+		LOG_INF(
+			"T-Cal: Committed point at idx %d (%.2fC): [%.5f, %.5f, %.5f] (delta: %.4f dps)",
+			idx,
+			(double)measured_temp,
+			(double)final_bias[0],
+			(double)final_bias[1],
+			(double)final_bias[2],
+			(double)max_delta
+		);
+	}
 
 	if (is_new_point || max_delta >= TCAL_SAVE_SIGNIFICANCE_THRESHOLD) {
 		if (tcal_save_defer_nvs) {
@@ -877,7 +883,7 @@ static void tcal_heated_stage_point(int idx, const float bias[3], float measured
 		point->updates++;
 	}
 
-	LOG_INF(
+	LOG_DBG(
 		"Heated T-Cal: staged idx %d (%.2fC), updates %u, bias [%.5f, %.5f, %.5f]",
 		idx,
 		(double)point->temp,
@@ -983,11 +989,13 @@ static void tcal_heated_stop_internal(tcal_heated_stop_reason_t reason, bool com
 	tcal_heated.stable_start_time = 0;
 	tcal_heated.rest_start_time = 0;
 
-	LOG_INF(
-		"Heated T-Cal stopped: %s, staged data %s",
-		tcal_heated_stop_reason_name(reason),
-		commit_staged ? "committed" : "discarded"
-	);
+	if (was_active) {
+		LOG_INF(
+			"Heated T-Cal stopped: %s, staged data %s",
+			tcal_heated_stop_reason_name(reason),
+			commit_staged ? "committed" : "discarded"
+		);
+	}
 }
 
 int sensor_tcal_heated_start(float target_temp)
@@ -1131,7 +1139,6 @@ int sensor_tcal_heated_tune(const char *param, float value)
 		return -EINVAL;
 	}
 
-	LOG_INF("Heated T-Cal tune: %s = %.4f", param, (double)value);
 	return 0;
 }
 

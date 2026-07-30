@@ -11,8 +11,6 @@
 #include <zephyr/sys/util.h>
 #include <hal/nrf_gpio.h>
 
-LOG_MODULE_REGISTER(heater, LOG_LEVEL_INF);
-
 #define ZEPHYR_USER_NODE DT_PATH(zephyr_user)
 #define HEATER_PWM_NODE DT_ALIAS(imu_heater)
 
