@@ -974,6 +974,7 @@ int sensor_request_scan(bool force)
 	sensor_life_mark_idle();
 	sensor_life_mark_scan_done();
 	main_suspended = false;
+	heater_resume_control();
 	sensor_sensor_init = false;
 	main_ok = false;
 	if (force) {
@@ -3089,6 +3090,10 @@ void sensor_loop(void)
 	}
 	while (1) {
 		int64_t time_begin = k_uptime_get();
+#if CONFIG_SENSOR_USE_TCAL && CONFIG_SENSOR_TCAL_HEATED
+		/* Heater controls are serialized here before any control calculation. */
+		sensor_tcal_heated_process_mailbox();
+#endif
 		if (main_ok) {
 			sensor_loop_frame_t frame = {0};
 #if DEBUG
@@ -3119,7 +3124,40 @@ void wait_for_threads(void)
 
 void main_imu_suspend(void)
 {
-	heater_force_off();
+	/*
+	 * Close the driver gate before waiting on the sensor mailbox.  Even if the
+	 * sensor thread is currently inside a control calculation, its eventual
+	 * non-zero write either precedes this checked zero (heater_lock ordering) or
+	 * is rejected by the suspend interlock.
+	 */
+	int force_off_err = heater_suspend_control();
+	if (IS_ENABLED(CONFIG_SYSTEM_IMU_HEATER) && force_off_err) {
+		LOG_ERR("Initial heater force-off before sensor suspend failed: %d",
+			force_off_err);
+	}
+
+#if CONFIG_SENSOR_USE_TCAL && CONFIG_SENSOR_TCAL_HEATED
+	if (sensor_tcal_heated_is_active()) {
+		int abort_err = sensor_tcal_heated_abort();
+		if (abort_err && abort_err != -EALREADY) {
+			LOG_WRN("Heated T-Cal abort before sensor suspend failed: %d", abort_err);
+		}
+	}
+#endif
+	/*
+	 * A synchronous abort may time out or may have reported a PWM error.  Keep
+	 * the interlock latched and retry the physical zero before freezing the
+	 * sensor thread.  Failure is explicit; later non-zero software writes remain
+	 * impossible until resume plus a fresh checked prepare.
+	 */
+	force_off_err = heater_force_off_checked();
+	for (int attempt = 0; attempt < 3 && force_off_err; attempt++) {
+		force_off_err = heater_force_off_checked();
+	}
+	if (IS_ENABLED(CONFIG_SYSTEM_IMU_HEATER) && force_off_err) {
+		LOG_ERR("Heater remains force-off faulted at sensor suspend: %d",
+			force_off_err);
+	}
 	main_suspended = true;
 	/* Thread cannot feed once frozen or self-suspended; pause WDT in all paths. */
 	watchdog_pause(WDT_CHANNEL_SENSOR);
@@ -3145,9 +3183,11 @@ void main_imu_resume(void)
 	if (!main_suspended) { // not suspended
 		return;
 	}
+	/* Clear the loop gate before waking it so it cannot immediately self-suspend. */
+	main_suspended = false;
+	heater_resume_control();
 	watchdog_resume(WDT_CHANNEL_SENSOR);
 	k_thread_resume(&sensor_thread_id);
-	main_suspended = false;
 	LOG_INF("Resumed sensor thread");
 }
 

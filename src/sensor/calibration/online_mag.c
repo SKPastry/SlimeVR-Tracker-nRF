@@ -680,8 +680,13 @@ bool sensor_calibration_online_mag_check(void)
 	online_last_checked_sample_count = online_total_sample_count;
 	online_last_check_time = now;
 
+	float existing_snapshot[4][3];
+	unsigned snapshot_key = irq_lock();
+	memcpy(existing_snapshot, magBAinv, sizeof(existing_snapshot));
+	irq_unlock(snapshot_key);
+
 	float zero[3] = {0};
-	bool has_existing = (v_diff_mag(magBAinv[0], zero) != 0);
+	bool has_existing = (v_diff_mag(existing_snapshot[0], zero) != 0);
 	float current_cv = has_existing ? sensor_calibration_get_mag_quality() : 1.0f;
 
 	// When fusion has a reliable calibration (CV < 4%) and is NOT experiencing
@@ -808,12 +813,12 @@ bool sensor_calibration_online_mag_check(void)
 		// Blending weight is similarity-adaptive: more similar → conservative,
 		// more divergent → faster adaptation (possible environment change).
 		float blended[4][3];
-		if (!magneto_blend_BAinv(blended, magBAinv, m_inv)) {
+		if (!magneto_blend_BAinv(blended, existing_snapshot, m_inv)) {
 			LOG_WRN("Online mag cal: blend validation failed, skipping update");
 			return false;
 		}
 
-		float similarity = magneto_BAinv_similarity(magBAinv, m_inv);
+		float similarity = magneto_BAinv_similarity(existing_snapshot, m_inv);
 
 		// Reject candidate if similarity is below threshold — the data
 		// is too inconsistent for a meaningful fit.  This guards against
@@ -848,8 +853,20 @@ bool sensor_calibration_online_mag_check(void)
 		        online_update_count + 1,
 		        (int)recent_sample_count, (double)dbias, (double)current_cv,
 		        (double)similarity);
+		if (sensor_calibration_mutation_claim() != 0) {
+			LOG_INF("Online mag cal: calibration ownership changed before apply");
+			return false;
+		}
 		{
 			unsigned key = irq_lock();
+			bool unchanged =
+				memcmp(magBAinv, existing_snapshot, sizeof(magBAinv)) == 0;
+			if (!unchanged) {
+				irq_unlock(key);
+				sensor_calibration_mutation_release();
+				LOG_INF("Online mag cal: live calibration changed before apply");
+				return false;
+			}
 			memcpy(magBAinv, blended, sizeof(magBAinv));
 			irq_unlock(key);
 		}
@@ -870,8 +887,20 @@ bool sensor_calibration_online_mag_check(void)
 		        (int)recent_sample_count, (double)dbias);
 
 		// First calibration: use candidate directly
+		if (sensor_calibration_mutation_claim() != 0) {
+			LOG_INF("Online mag cal: calibration ownership changed before apply");
+			return false;
+		}
 		{
 			unsigned key = irq_lock();
+			bool unchanged =
+				memcmp(magBAinv, existing_snapshot, sizeof(magBAinv)) == 0;
+			if (!unchanged) {
+				irq_unlock(key);
+				sensor_calibration_mutation_release();
+				LOG_INF("Online mag cal: live calibration changed before apply");
+				return false;
+			}
 			memcpy(magBAinv, m_inv, sizeof(magBAinv));
 			irq_unlock(key);
 		}
@@ -901,6 +930,7 @@ bool sensor_calibration_online_mag_check(void)
 			(double)m_inv[2][i], (double)m_inv[3][i]);
 	}
 
+	sensor_calibration_mutation_release();
 	return true;
 }
 

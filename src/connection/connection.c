@@ -1292,6 +1292,7 @@ void connection_thread(void)
 				memset(&ping[3], 0x00, 4);
 				ping[7] = esb_get_ping_ack_flag();
 				memset(&ping[8], 0x00, 4);
+				esb_prepare_ping_extension(ping);
 				ping[ESB_PING_LEN - 1] = 0;
 				esb_write(ping, false, ESB_PING_LEN);
 				last_ping_time = now;

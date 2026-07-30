@@ -1,0 +1,81 @@
+/* SPDX-License-Identifier: MIT */
+#ifndef SLIMENRF_REMOTE_TCAL_PROTOCOL
+#define SLIMENRF_REMOTE_TCAL_PROTOCOL
+
+#include <stdint.h>
+
+/*
+ * Experimental private ESB extension.  These values and offsets are the
+ * production wire contract shared with native_sim tests; host/HID opcodes
+ * remain deliberately separate.
+ */
+#define SK_ESB_REMOTE_TCAL_PACKET_LEN 13U
+#define SK_ESB_REMOTE_TCAL_PING_TYPE  0xF0U
+#define SK_ESB_REMOTE_TCAL_PONG_TYPE  0xF1U
+#define SK_ESB_REMOTE_TCAL_NORMAL_FLAG 0x00U
+
+#define SK_ESB_EXT_ESCAPE  0xC8U
+#define SK_ESB_EXT_MAGIC_0  ((uint8_t)'S')
+#define SK_ESB_EXT_MAGIC_1  ((uint8_t)'K')
+#define SK_ESB_EXT_VERSION  1U
+
+#define SK_ESB_EXT_PACKET_TYPE_OFFSET       0U
+#define SK_ESB_EXT_TRACKER_ID_OFFSET        1U
+#define SK_ESB_EXT_COUNTER_OFFSET           2U
+#define SK_ESB_EXT_PING_TIME_SYNC_OFFSET    3U
+#define SK_ESB_EXT_PONG_MAGIC_0_OFFSET      3U
+#define SK_ESB_EXT_PONG_MAGIC_1_OFFSET      4U
+#define SK_ESB_EXT_PONG_VERSION_OFFSET      5U
+#define SK_ESB_EXT_PONG_ACTION_OFFSET       6U
+#define SK_ESB_EXT_FLAG_OFFSET              7U
+#define SK_ESB_EXT_TRANSACTION_OFFSET       8U
+#define SK_ESB_EXT_PING_MAGIC_0_OFFSET      8U
+#define SK_ESB_EXT_PING_MAGIC_1_OFFSET      9U
+#define SK_ESB_EXT_PING_VERSION_OFFSET      10U
+#define SK_ESB_EXT_PONG_TARGET_OFFSET       10U
+#define SK_ESB_EXT_PING_RESULT_OFFSET       10U
+#define SK_ESB_EXT_PING_STATUS_OFFSET       11U
+#define SK_ESB_EXT_CRC_OFFSET               12U
+
+enum sk_esb_heated_tcal_action {
+	SK_ESB_HEATED_TCAL_START = 1,
+	SK_ESB_HEATED_TCAL_STOP = 2,
+	SK_ESB_HEATED_TCAL_ABORT = 3,
+};
+
+enum sk_esb_heated_tcal_result {
+	SK_ESB_HEATED_TCAL_OK = 0,
+	SK_ESB_HEATED_TCAL_INVALID = 1,
+	SK_ESB_HEATED_TCAL_UNSUPPORTED = 2,
+	SK_ESB_HEATED_TCAL_BUSY = 3,
+	SK_ESB_HEATED_TCAL_POWER_REQUIRED = 4,
+	SK_ESB_HEATED_TCAL_NOT_READY = 5,
+	SK_ESB_HEATED_TCAL_TIMEOUT = 6,
+	SK_ESB_HEATED_TCAL_HARDWARE_ERROR = 7,
+	SK_ESB_HEATED_TCAL_NOT_ACTIVE = 8,
+	SK_ESB_HEATED_TCAL_INTERNAL = 9,
+	SK_ESB_HEATED_TCAL_CANCELED = 10,
+};
+
+#define SK_ESB_HEATED_TCAL_RESULT_MARKER  0xA0U
+#define SK_ESB_HEATED_TCAL_DEFAULT_TARGET INT16_MIN
+
+/*
+ * Stable on-wire stop reasons carried in status byte bits 3..7.  Keep this
+ * protocol enum independent from the sensor runtime's internal state enum.
+ */
+enum sk_esb_heated_tcal_stop_reason {
+	SK_ESB_HEATED_TCAL_STOP_NONE = 0,
+	SK_ESB_HEATED_TCAL_STOP_COMPLETE = 1,
+	SK_ESB_HEATED_TCAL_STOP_USER = 2,
+	SK_ESB_HEATED_TCAL_STOP_TIMEOUT = 3,
+	SK_ESB_HEATED_TCAL_STOP_POWER_LOST = 4,
+	SK_ESB_HEATED_TCAL_STOP_IMU_POWER_OFF = 5,
+	SK_ESB_HEATED_TCAL_STOP_TEMP_STALE = 6,
+	SK_ESB_HEATED_TCAL_STOP_OVERTEMP = 7,
+	SK_ESB_HEATED_TCAL_STOP_RISE_FAST = 8,
+	SK_ESB_HEATED_TCAL_STOP_HEATER_ERROR = 9,
+	SK_ESB_HEATED_TCAL_STOP_START_FAILED = 10,
+};
+
+#endif /* SLIMENRF_REMOTE_TCAL_PROTOCOL */

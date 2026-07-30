@@ -601,6 +601,16 @@ config SENSOR_TCAL_HEATED_DEBUG_LOG
 
 endmenu
 
+config SK_REMOTE_HEATED_TCAL_TEST
+    bool "Experimental receiver-controlled heated T-Cal"
+    default n
+    depends on SENSOR_TCAL_HEATED
+    help
+        Enable the private, experimental SK ESB extension used to start,
+        stop, and abort heated temperature calibration from a receiver.
+        This protocol is intentionally disabled by default and its escape
+        value is not a permanent upstream allocation.
+
 config RADIO_TX_POWER
     int "Radio output power (dBm)"
     default 8

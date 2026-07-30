@@ -41,6 +41,7 @@
 #include <zephyr/sys/atomic.h>
 #include <zephyr/kernel.h>
 
+#include <math.h>
 #include <stdlib.h>
 #include "esb.h"
 #include "tdma.h"
@@ -126,6 +127,1011 @@ static float received_sens_data[3] = {0};   // Store sensitivity data
 static uint8_t received_sens_auto_axis = 0;
 static uint16_t received_sens_auto_revolutions = 0;
 #define REMOTE_COMMAND_DELAY_MS 1500
+
+#if CONFIG_SK_REMOTE_HEATED_TCAL_TEST
+#define REMOTE_TCAL_START_CONFIRM_DELAY_MS 1500
+#define REMOTE_TCAL_MATCH_FRESH_MS         2000
+#define REMOTE_TCAL_WAIT_MAX_MS            4000
+#define REMOTE_TCAL_SENSOR_EXEC_MS         2000
+
+BUILD_ASSERT(ESB_PING_LEN == SK_ESB_REMOTE_TCAL_PACKET_LEN);
+BUILD_ASSERT(ESB_PONG_LEN == SK_ESB_REMOTE_TCAL_PACKET_LEN);
+BUILD_ASSERT(ESB_PING_TYPE == SK_ESB_REMOTE_TCAL_PING_TYPE);
+BUILD_ASSERT(ESB_PONG_TYPE == SK_ESB_REMOTE_TCAL_PONG_TYPE);
+BUILD_ASSERT(ESB_PONG_FLAG_NORMAL == SK_ESB_REMOTE_TCAL_NORMAL_FLAG);
+
+enum remote_tcal_transport_state {
+	REMOTE_TCAL_IDLE = 0,
+	REMOTE_TCAL_WAIT_START,
+	REMOTE_TCAL_SENSOR_EXEC,
+	REMOTE_TCAL_RESULT_READY,
+};
+
+enum remote_tcal_safety_preempt_mode {
+	REMOTE_TCAL_SAFETY_PREEMPT_NONE = 0,
+	REMOTE_TCAL_SAFETY_PREEMPT_LEGACY,
+	REMOTE_TCAL_SAFETY_PREEMPT_PAIRING,
+};
+
+struct remote_tcal_payload {
+	uint16_t transaction_id;
+	uint8_t action;
+	int16_t target_centi_c;
+};
+
+static struct {
+	enum remote_tcal_transport_state state;
+	uint32_t generation;
+	struct remote_tcal_payload payload;
+	uint8_t matching_count;
+	int64_t first_rx_ms;
+	int64_t last_match_ms;
+	int64_t execute_deadline_ms;
+	uint32_t sensor_token;
+	uint8_t result;
+	uint8_t result_status;
+	bool cancel_after_abort;
+	uint8_t abort_override_result;
+	bool result_override_pending;
+	struct remote_tcal_payload result_override_payload;
+	uint8_t result_override;
+	bool cached_valid;
+	struct remote_tcal_payload cached_payload;
+	uint8_t cached_result;
+	uint8_t cached_result_status;
+	enum remote_tcal_safety_preempt_mode safety_preempt_mode;
+	uint32_t safety_preempt_token;
+	bool safety_preempt_submit_in_progress;
+	bool safety_preempt_payload_valid;
+	struct remote_tcal_payload safety_preempt_payload;
+} remote_tcal;
+
+static bool remote_tcal_payload_equal(const struct remote_tcal_payload *a,
+				      const struct remote_tcal_payload *b)
+{
+	return a->transaction_id == b->transaction_id &&
+	       a->action == b->action &&
+	       a->target_centi_c == b->target_centi_c;
+}
+
+static uint8_t remote_tcal_map_errno(int err)
+{
+	switch (err) {
+	case 0:
+		return SK_ESB_HEATED_TCAL_OK;
+	case -EINVAL:
+	case -ERANGE:
+		return SK_ESB_HEATED_TCAL_INVALID;
+	case -ENOTSUP:
+		return SK_ESB_HEATED_TCAL_UNSUPPORTED;
+	case -EBUSY:
+	case -EINPROGRESS:
+		return SK_ESB_HEATED_TCAL_BUSY;
+	case -EPERM:
+		return SK_ESB_HEATED_TCAL_POWER_REQUIRED;
+	case -EAGAIN:
+		return SK_ESB_HEATED_TCAL_NOT_READY;
+	case -ETIMEDOUT:
+		return SK_ESB_HEATED_TCAL_TIMEOUT;
+	case -ENODEV:
+	case -EIO:
+		return SK_ESB_HEATED_TCAL_HARDWARE_ERROR;
+	case -EALREADY:
+	case -ENOENT:
+		return SK_ESB_HEATED_TCAL_NOT_ACTIVE;
+	case -ECANCELED:
+		return SK_ESB_HEATED_TCAL_CANCELED;
+	default:
+		return SK_ESB_HEATED_TCAL_INTERNAL;
+	}
+}
+
+static void remote_tcal_cache_result_with_status_locked(
+	const struct remote_tcal_payload *payload, uint8_t result, uint8_t status)
+{
+	remote_tcal.cached_payload = *payload;
+	remote_tcal.cached_result = result;
+	remote_tcal.cached_result_status = status;
+	remote_tcal.cached_valid = true;
+}
+
+static void remote_tcal_set_result_with_status_locked(
+	const struct remote_tcal_payload *payload, uint8_t result, uint8_t status)
+{
+	remote_tcal.payload = *payload;
+	remote_tcal.result = result;
+	remote_tcal.result_status = status;
+	remote_tcal.state = REMOTE_TCAL_RESULT_READY;
+	remote_tcal_cache_result_with_status_locked(payload, result, status);
+	remote_tcal.sensor_token = 0;
+	remote_tcal.cancel_after_abort = false;
+	remote_tcal.result_override_pending = false;
+}
+
+static void remote_tcal_set_result_locked(const struct remote_tcal_payload *payload,
+					   uint8_t result)
+{
+	remote_tcal_set_result_with_status_locked(
+		payload, result, sensor_tcal_heated_status_snapshot());
+}
+
+static void remote_tcal_defer_result_locked(
+	const struct remote_tcal_payload *payload, uint8_t result)
+{
+	remote_tcal.result_override_payload = *payload;
+	remote_tcal.result_override = result;
+	remote_tcal.result_override_pending = true;
+}
+
+static bool remote_tcal_start_conflicts(void)
+{
+	return received_remote_command != ESB_PONG_FLAG_NORMAL ||
+	       acked_remote_command != ESB_PONG_FLAG_NORMAL ||
+	       esb_ota_is_active() || connection_get_data_collection();
+}
+
+static void remote_tcal_abandon_replaced_sensor_token(
+	uint32_t old_token, uint32_t new_token)
+{
+	if (old_token != 0 && old_token != new_token) {
+		sensor_tcal_heated_abandon(old_token);
+	}
+}
+
+static void remote_tcal_submit_sensor(const struct remote_tcal_payload *payload,
+				      int64_t deadline_ms,
+				      bool preserve_active_on_error,
+				      uint32_t expected_generation)
+{
+	sensor_tcal_heated_cmd_t command;
+	float value = 0.0f;
+	unsigned key = irq_lock();
+	if (remote_tcal.generation != expected_generation ||
+	    remote_tcal.safety_preempt_mode != REMOTE_TCAL_SAFETY_PREEMPT_NONE) {
+		irq_unlock(key);
+		return;
+	}
+	enum remote_tcal_transport_state expected_state = remote_tcal.state;
+	uint32_t expected_token = remote_tcal.sensor_token;
+	irq_unlock(key);
+
+	switch (payload->action) {
+	case SK_ESB_HEATED_TCAL_START:
+		command = SENSOR_TCAL_HEATED_CMD_START;
+		value = payload->target_centi_c == SK_ESB_HEATED_TCAL_DEFAULT_TARGET ?
+			NAN : (float)payload->target_centi_c / 100.0f;
+		break;
+	case SK_ESB_HEATED_TCAL_STOP:
+		command = SENSOR_TCAL_HEATED_CMD_STOP;
+		break;
+	case SK_ESB_HEATED_TCAL_ABORT:
+		command = SENSOR_TCAL_HEATED_CMD_ABORT;
+		break;
+	default:
+		unsigned invalid_key = irq_lock();
+		if (remote_tcal.generation == expected_generation &&
+		    remote_tcal.state == expected_state &&
+		    remote_tcal.sensor_token == expected_token) {
+			remote_tcal_set_result_locked(
+				payload, SK_ESB_HEATED_TCAL_INVALID);
+		}
+		irq_unlock(invalid_key);
+		return;
+	}
+
+	uint32_t token = 0;
+	uint32_t old_token = 0;
+	int err = sensor_tcal_heated_submit(command, value, deadline_ms, &token);
+	bool published = false;
+	key = irq_lock();
+	bool still_current =
+		remote_tcal.generation == expected_generation &&
+		remote_tcal.state == expected_state &&
+		remote_tcal.sensor_token == expected_token &&
+		remote_tcal.safety_preempt_mode == REMOTE_TCAL_SAFETY_PREEMPT_NONE;
+	if (err && still_current) {
+		if (!preserve_active_on_error) {
+			remote_tcal_set_result_locked(payload, remote_tcal_map_errno(err));
+		}
+	} else if (err == 0 && still_current) {
+		old_token = remote_tcal.sensor_token;
+		remote_tcal.payload = *payload;
+		remote_tcal.sensor_token = token;
+		remote_tcal.execute_deadline_ms = deadline_ms;
+		remote_tcal.result_override_pending = false;
+		remote_tcal.state = REMOTE_TCAL_SENSOR_EXEC;
+		published = true;
+	}
+	irq_unlock(key);
+	if (published) {
+		remote_tcal_abandon_replaced_sensor_token(old_token, token);
+	} else if (err == 0) {
+		/* A reset/state transition won the race; leave no orphan poll token. */
+		sensor_tcal_heated_abandon(token);
+	}
+}
+
+static bool remote_tcal_abort_then_result(const struct remote_tcal_payload *payload,
+					  uint8_t final_result,
+					  uint32_t expected_generation)
+{
+	uint32_t token;
+	uint32_t old_token = 0;
+	unsigned key = irq_lock();
+	if (remote_tcal.generation != expected_generation ||
+	    remote_tcal.safety_preempt_mode != REMOTE_TCAL_SAFETY_PREEMPT_NONE) {
+		irq_unlock(key);
+		return false;
+	}
+	enum remote_tcal_transport_state expected_state = remote_tcal.state;
+	uint32_t expected_token = remote_tcal.sensor_token;
+	irq_unlock(key);
+
+	int64_t deadline = k_uptime_get() + REMOTE_TCAL_SENSOR_EXEC_MS;
+	int err = sensor_tcal_heated_submit(
+		SENSOR_TCAL_HEATED_CMD_ABORT, 0.0f, deadline, &token);
+	bool published = false;
+	key = irq_lock();
+	bool still_current =
+		remote_tcal.generation == expected_generation &&
+		remote_tcal.state == expected_state &&
+		remote_tcal.sensor_token == expected_token &&
+		remote_tcal.safety_preempt_mode == REMOTE_TCAL_SAFETY_PREEMPT_NONE;
+	if (err == 0 && still_current) {
+		old_token = remote_tcal.sensor_token;
+		remote_tcal.payload = *payload;
+		remote_tcal.sensor_token = token;
+		remote_tcal.execute_deadline_ms = deadline;
+		remote_tcal.cancel_after_abort = true;
+		remote_tcal.abort_override_result = final_result;
+		remote_tcal.result_override_pending = false;
+		remote_tcal.state = REMOTE_TCAL_SENSOR_EXEC;
+		published = true;
+	} else if ((err == -EALREADY || err == -ENOENT) && still_current) {
+		remote_tcal_set_result_locked(payload, final_result);
+	}
+	irq_unlock(key);
+	if (published) {
+		remote_tcal_abandon_replaced_sensor_token(old_token, token);
+	} else if (err == 0) {
+		sensor_tcal_heated_abandon(token);
+	}
+	return published ||
+	       ((err == -EALREADY || err == -ENOENT) && still_current);
+}
+
+static bool remote_tcal_is_critical_legacy_command(uint8_t flag)
+{
+	return flag == ESB_PONG_FLAG_SHUTDOWN ||
+	       flag == ESB_PONG_FLAG_REBOOT ||
+	       flag == ESB_PONG_FLAG_CLEAR ||
+	       flag == ESB_PONG_FLAG_DFU ||
+	       flag == ESB_PONG_FLAG_DFU_OTA ||
+	       flag == ESB_PONG_FLAG_SCAN ||
+	       flag == ESB_PONG_FLAG_DATA_COLLECT_ON ||
+	       flag == ESB_PONG_FLAG_DATA_COLLECT_OFF ||
+	       (flag >= ESB_PONG_FLAG_OTA_QUERY_INFO &&
+		flag <= ESB_PONG_FLAG_OTA_UNSUPPRESS);
+}
+
+static void remote_tcal_enter_idle_without_handshake_locked(
+	const struct remote_tcal_payload *payload, bool cache_canceled,
+	bool clear_cache)
+{
+	uint8_t status = sensor_tcal_heated_status_snapshot();
+
+	if (payload != NULL) {
+		remote_tcal.payload = *payload;
+		remote_tcal.result = SK_ESB_HEATED_TCAL_CANCELED;
+		remote_tcal.result_status = status;
+		if (cache_canceled && payload->transaction_id != 0) {
+			remote_tcal_cache_result_with_status_locked(
+				payload, SK_ESB_HEATED_TCAL_CANCELED, status);
+		}
+	}
+	if (clear_cache) {
+		remote_tcal.cached_valid = false;
+	}
+
+	remote_tcal.state = REMOTE_TCAL_IDLE;
+	remote_tcal.sensor_token = 0;
+	remote_tcal.cancel_after_abort = false;
+	remote_tcal.result_override_pending = false;
+	remote_tcal.safety_preempt_mode = REMOTE_TCAL_SAFETY_PREEMPT_NONE;
+	remote_tcal.safety_preempt_token = 0;
+	remote_tcal.safety_preempt_submit_in_progress = false;
+	remote_tcal.safety_preempt_payload_valid = false;
+}
+
+/*
+ * Start or continue a no-receiver safety barrier.  Unlike
+ * remote_tcal_abort_then_result(), this path never publishes an extension
+ * result: after the sensor-thread ABORT confirms physical safety it returns the
+ * transport directly to IDLE so a waiting legacy command can be accepted.
+ */
+static void remote_tcal_request_safety_preempt(
+	enum remote_tcal_safety_preempt_mode requested_mode,
+	const struct remote_tcal_payload *payload, bool payload_valid)
+{
+	bool submit_abort = false;
+	uint32_t expected_generation;
+	uint32_t token_to_abandon = 0;
+	unsigned key = irq_lock();
+
+	if (requested_mode == REMOTE_TCAL_SAFETY_PREEMPT_PAIRING) {
+		remote_tcal.safety_preempt_mode =
+			REMOTE_TCAL_SAFETY_PREEMPT_PAIRING;
+		remote_tcal.safety_preempt_payload_valid = false;
+		remote_tcal.cached_valid = false;
+	} else if (remote_tcal.safety_preempt_mode ==
+		   REMOTE_TCAL_SAFETY_PREEMPT_NONE) {
+		remote_tcal.safety_preempt_mode =
+			REMOTE_TCAL_SAFETY_PREEMPT_LEGACY;
+		remote_tcal.safety_preempt_payload_valid =
+			payload_valid && payload != NULL;
+		if (remote_tcal.safety_preempt_payload_valid) {
+			remote_tcal.safety_preempt_payload = *payload;
+		}
+	}
+
+	if (remote_tcal.safety_preempt_token != 0 ||
+	    remote_tcal.safety_preempt_submit_in_progress) {
+		irq_unlock(key);
+		return;
+	}
+
+	bool current_token_is_safety =
+		remote_tcal.state == REMOTE_TCAL_SENSOR_EXEC &&
+		remote_tcal.sensor_token != 0 &&
+		(remote_tcal.payload.action == SK_ESB_HEATED_TCAL_STOP ||
+		 remote_tcal.payload.action == SK_ESB_HEATED_TCAL_ABORT ||
+		 remote_tcal.cancel_after_abort);
+	if (current_token_is_safety) {
+		remote_tcal.safety_preempt_token = remote_tcal.sensor_token;
+		remote_tcal.sensor_token = 0;
+		remote_tcal.cancel_after_abort = false;
+		remote_tcal.result_override_pending = false;
+		remote_tcal.state = REMOTE_TCAL_SENSOR_EXEC;
+		irq_unlock(key);
+		return;
+	}
+
+	/*
+	 * No wireless consumer remains once a safety preempt starts.  Detach the
+	 * old START token before submitting ABORT; this also releases any alias
+	 * reservation immediately and lets an alias-full mailbox accept safety.
+	 */
+	token_to_abandon = remote_tcal.sensor_token;
+	remote_tcal.sensor_token = 0;
+	remote_tcal.safety_preempt_submit_in_progress = true;
+	expected_generation = remote_tcal.generation;
+	submit_abort = true;
+	irq_unlock(key);
+
+	if (token_to_abandon != 0) {
+		sensor_tcal_heated_abandon(token_to_abandon);
+	}
+	if (!submit_abort) {
+		return;
+	}
+
+	uint32_t token = 0;
+	int err = sensor_tcal_heated_submit(
+		SENSOR_TCAL_HEATED_CMD_ABORT, 0.0f, 0, &token);
+	uint32_t old_token = 0;
+	bool published = false;
+
+	key = irq_lock();
+	if (remote_tcal.generation == expected_generation &&
+	    remote_tcal.safety_preempt_mode !=
+		    REMOTE_TCAL_SAFETY_PREEMPT_NONE &&
+	    remote_tcal.safety_preempt_submit_in_progress) {
+		remote_tcal.safety_preempt_submit_in_progress = false;
+		if (err == 0) {
+			old_token = remote_tcal.sensor_token;
+			remote_tcal.sensor_token = 0;
+			remote_tcal.safety_preempt_token = token;
+			remote_tcal.cancel_after_abort = false;
+			remote_tcal.result_override_pending = false;
+			remote_tcal.state = REMOTE_TCAL_SENSOR_EXEC;
+			published = true;
+		}
+	}
+	irq_unlock(key);
+
+	if (published) {
+		remote_tcal_abandon_replaced_sensor_token(old_token, token);
+	} else if (err == 0) {
+		sensor_tcal_heated_abandon(token);
+	}
+}
+
+/*
+ * Returns true while a legacy command must remain at the Receiver.  Critical
+ * commands cancel WAIT_START immediately (nothing reached the sensor thread),
+ * or wait behind the no-handshake safety barrier when START may have executed.
+ */
+static bool remote_tcal_defer_legacy_command(uint8_t flag)
+{
+	unsigned key = irq_lock();
+	enum remote_tcal_transport_state state = remote_tcal.state;
+	uint32_t generation = remote_tcal.generation;
+	struct remote_tcal_payload payload = remote_tcal.payload;
+	uint8_t result = remote_tcal.result;
+	enum remote_tcal_safety_preempt_mode preempt_mode =
+		remote_tcal.safety_preempt_mode;
+	bool cached_hardware_error =
+		remote_tcal.cached_valid &&
+		remote_tcal.cached_result == SK_ESB_HEATED_TCAL_HARDWARE_ERROR;
+	struct remote_tcal_payload cached_payload = remote_tcal.cached_payload;
+	bool cached_valid = remote_tcal.cached_valid;
+	irq_unlock(key);
+
+	if (!remote_tcal_is_critical_legacy_command(flag)) {
+		return state != REMOTE_TCAL_IDLE ||
+		       preempt_mode != REMOTE_TCAL_SAFETY_PREEMPT_NONE;
+	}
+	if (preempt_mode != REMOTE_TCAL_SAFETY_PREEMPT_NONE) {
+		return true;
+	}
+
+	if (state == REMOTE_TCAL_WAIT_START) {
+		key = irq_lock();
+		bool canceled =
+			remote_tcal.generation == generation &&
+			remote_tcal.state == REMOTE_TCAL_WAIT_START &&
+			remote_tcal.safety_preempt_mode ==
+				REMOTE_TCAL_SAFETY_PREEMPT_NONE;
+		if (canceled) {
+			remote_tcal_enter_idle_without_handshake_locked(
+				&payload, true, false);
+		}
+		irq_unlock(key);
+		/* Accept this same legacy PONG immediately after a proven WAIT cancel. */
+		return !canceled;
+	}
+
+	if (state == REMOTE_TCAL_IDLE) {
+		if (!sensor_tcal_heated_is_active() && !cached_hardware_error) {
+			return false;
+		}
+		const struct remote_tcal_payload *cancel_payload =
+			cached_valid ? &cached_payload : &payload;
+		remote_tcal_request_safety_preempt(
+			REMOTE_TCAL_SAFETY_PREEMPT_LEGACY,
+			cancel_payload,
+			cancel_payload->transaction_id != 0);
+		return true;
+	}
+
+	bool needs_abort =
+		state == REMOTE_TCAL_SENSOR_EXEC ||
+		payload.action == SK_ESB_HEATED_TCAL_START ||
+		result == SK_ESB_HEATED_TCAL_HARDWARE_ERROR ||
+		sensor_tcal_heated_is_active();
+	if (!needs_abort && state == REMOTE_TCAL_RESULT_READY) {
+		key = irq_lock();
+		bool canceled =
+			remote_tcal.generation == generation &&
+			remote_tcal.state == REMOTE_TCAL_RESULT_READY &&
+			remote_tcal.safety_preempt_mode ==
+				REMOTE_TCAL_SAFETY_PREEMPT_NONE;
+		if (canceled) {
+			remote_tcal_enter_idle_without_handshake_locked(
+				&payload, true, false);
+		}
+		irq_unlock(key);
+		return !canceled;
+	}
+
+	remote_tcal_request_safety_preempt(
+		REMOTE_TCAL_SAFETY_PREEMPT_LEGACY,
+		&payload, payload.transaction_id != 0);
+	return true;
+}
+
+static void remote_tcal_reset_for_pairing(void)
+{
+	unsigned key = irq_lock();
+	remote_tcal.generation++;
+	remote_tcal.cached_valid = false;
+	remote_tcal.safety_preempt_mode =
+		REMOTE_TCAL_SAFETY_PREEMPT_PAIRING;
+	remote_tcal.safety_preempt_payload_valid = false;
+	remote_tcal.safety_preempt_submit_in_progress = false;
+	remote_tcal.cancel_after_abort = false;
+	remote_tcal.result_override_pending = false;
+	if (remote_tcal.state == REMOTE_TCAL_WAIT_START) {
+		remote_tcal.state = REMOTE_TCAL_IDLE;
+	}
+	irq_unlock(key);
+
+	/*
+	 * Always issue the barrier: it also closes the narrow race where a START
+	 * was accepted by the mailbox but had not yet published SENSOR_EXEC when
+	 * pairing reset incremented generation.
+	 */
+	remote_tcal_request_safety_preempt(
+		REMOTE_TCAL_SAFETY_PREEMPT_PAIRING, NULL, false);
+}
+
+static void remote_tcal_handle_pong(const uint8_t pong[ESB_PONG_LEN])
+{
+	/* Bad private magic/version is ignored, never fed to generic flag echo. */
+	if (pong[SK_ESB_EXT_PONG_MAGIC_0_OFFSET] != SK_ESB_EXT_MAGIC_0 ||
+	    pong[SK_ESB_EXT_PONG_MAGIC_1_OFFSET] != SK_ESB_EXT_MAGIC_1 ||
+	    pong[SK_ESB_EXT_PONG_VERSION_OFFSET] != SK_ESB_EXT_VERSION) {
+		return;
+	}
+
+	unsigned preempt_key = irq_lock();
+	bool safety_preempt_pending =
+		remote_tcal.safety_preempt_mode !=
+		REMOTE_TCAL_SAFETY_PREEMPT_NONE;
+	irq_unlock(preempt_key);
+	if (safety_preempt_pending) {
+		return;
+	}
+
+	struct remote_tcal_payload incoming = {
+		.transaction_id =
+			sys_get_be16(&pong[SK_ESB_EXT_TRANSACTION_OFFSET]),
+		.action = pong[SK_ESB_EXT_PONG_ACTION_OFFSET],
+		.target_centi_c = (int16_t)sys_get_be16(
+			&pong[SK_ESB_EXT_PONG_TARGET_OFFSET]),
+	};
+	bool valid = incoming.transaction_id != 0 &&
+		(incoming.action == SK_ESB_HEATED_TCAL_START ||
+		 incoming.action == SK_ESB_HEATED_TCAL_STOP ||
+		 incoming.action == SK_ESB_HEATED_TCAL_ABORT) &&
+		(incoming.action == SK_ESB_HEATED_TCAL_START ||
+		 incoming.target_centi_c == 0);
+	int64_t now = k_uptime_get();
+
+	unsigned key = irq_lock();
+	enum remote_tcal_transport_state state = remote_tcal.state;
+	uint32_t generation = remote_tcal.generation;
+	struct remote_tcal_payload current = remote_tcal.payload;
+	if (remote_tcal.safety_preempt_mode !=
+	    REMOTE_TCAL_SAFETY_PREEMPT_NONE) {
+		irq_unlock(key);
+		return;
+	}
+
+	if (!valid) {
+		bool same_transaction = incoming.transaction_id != 0 &&
+			incoming.transaction_id == current.transaction_id;
+		if (state == REMOTE_TCAL_IDLE) {
+			if (incoming.transaction_id != 0) {
+				remote_tcal_set_result_locked(
+					&incoming, SK_ESB_HEATED_TCAL_INVALID);
+			}
+			irq_unlock(key);
+			return;
+		}
+		if (!same_transaction) {
+			/* Malformed unrelated traffic must not replace a live transaction. */
+			irq_unlock(key);
+			return;
+		}
+		if (state == REMOTE_TCAL_WAIT_START) {
+			/* Cancel an unexecuted conflicting START safely. */
+			remote_tcal_set_result_locked(
+				&incoming, SK_ESB_HEATED_TCAL_INVALID);
+			irq_unlock(key);
+			return;
+		}
+		if (state == REMOTE_TCAL_SENSOR_EXEC) {
+			if (current.action != SK_ESB_HEATED_TCAL_START) {
+				/*
+				 * STOP/ABORT owns the result until its zero-duty write has
+				 * completed.  Publish the mismatch only afterwards.
+				 */
+				remote_tcal_defer_result_locked(
+					&incoming, SK_ESB_HEATED_TCAL_INVALID);
+				irq_unlock(key);
+				return;
+			}
+			irq_unlock(key);
+			(void)remote_tcal_abort_then_result(
+				&incoming, SK_ESB_HEATED_TCAL_INVALID, generation);
+			return;
+		}
+		if (current.action != SK_ESB_HEATED_TCAL_START) {
+			remote_tcal_set_result_locked(
+				&incoming, SK_ESB_HEATED_TCAL_INVALID);
+			irq_unlock(key);
+			return;
+		}
+		irq_unlock(key);
+		(void)remote_tcal_abort_then_result(
+			&incoming, SK_ESB_HEATED_TCAL_INVALID, generation);
+		return;
+	}
+
+	if (state == REMOTE_TCAL_RESULT_READY) {
+		if (remote_tcal_payload_equal(&incoming, &current)) {
+			irq_unlock(key);
+			return;
+		}
+		if (incoming.transaction_id == current.transaction_id) {
+			bool start_may_be_active =
+				current.action == SK_ESB_HEATED_TCAL_START;
+			if (!start_may_be_active) {
+				remote_tcal_set_result_locked(
+					&incoming, SK_ESB_HEATED_TCAL_INVALID);
+			}
+			irq_unlock(key);
+			if (start_may_be_active) {
+				(void)remote_tcal_abort_then_result(
+					&incoming,
+					SK_ESB_HEATED_TCAL_INVALID,
+					generation);
+			}
+			return;
+		}
+		if (incoming.action == SK_ESB_HEATED_TCAL_STOP ||
+		    incoming.action == SK_ESB_HEATED_TCAL_ABORT) {
+			/*
+			 * Receiver may atomically replace a completed START before it can
+			 * acknowledge the old result with NORMAL.  Let the new safety
+			 * transaction supersede RESULT_READY so an active heater cannot be
+			 * stranded behind the old result handshake.
+			 */
+			irq_unlock(key);
+			remote_tcal_submit_sensor(
+				&incoming,
+				now + REMOTE_TCAL_SENSOR_EXEC_MS,
+				false,
+				generation);
+			return;
+		}
+		irq_unlock(key);
+		return;
+	}
+
+	if (state == REMOTE_TCAL_SENSOR_EXEC) {
+		if (remote_tcal_payload_equal(&incoming, &current)) {
+			irq_unlock(key);
+			return;
+		}
+		if (incoming.transaction_id == current.transaction_id) {
+			irq_unlock(key);
+			if (current.action == SK_ESB_HEATED_TCAL_START) {
+				(void)remote_tcal_abort_then_result(
+					&incoming,
+					SK_ESB_HEATED_TCAL_INVALID,
+					generation);
+			} else {
+				key = irq_lock();
+				if (remote_tcal.generation == generation &&
+				    remote_tcal.state == REMOTE_TCAL_SENSOR_EXEC &&
+				    remote_tcal.safety_preempt_mode ==
+					    REMOTE_TCAL_SAFETY_PREEMPT_NONE) {
+					remote_tcal_defer_result_locked(
+						&incoming,
+						SK_ESB_HEATED_TCAL_INVALID);
+				}
+				irq_unlock(key);
+			}
+			return;
+		}
+		if (current.action == SK_ESB_HEATED_TCAL_START &&
+		    (incoming.action == SK_ESB_HEATED_TCAL_STOP ||
+		     incoming.action == SK_ESB_HEATED_TCAL_ABORT)) {
+			irq_unlock(key);
+			remote_tcal_submit_sensor(
+				&incoming,
+				now + REMOTE_TCAL_SENSOR_EXEC_MS,
+				true,
+				generation);
+			return;
+		}
+		if (current.action == SK_ESB_HEATED_TCAL_STOP &&
+		    incoming.action == SK_ESB_HEATED_TCAL_ABORT) {
+			/*
+			 * ABORT upgrades a pending STOP.  If STOP crossed its execution
+			 * boundary the mailbox runs ABORT next and reports NOT_ACTIVE or
+			 * CANCELED, never a false "discard succeeded".
+			 */
+			irq_unlock(key);
+			remote_tcal_submit_sensor(
+				&incoming,
+				now + REMOTE_TCAL_SENSOR_EXEC_MS,
+				true,
+				generation);
+			return;
+		}
+		irq_unlock(key);
+		return;
+	}
+
+	if (state == REMOTE_TCAL_WAIT_START) {
+		if (remote_tcal_payload_equal(&incoming, &current)) {
+			if (remote_tcal.matching_count < UINT8_MAX) {
+				remote_tcal.matching_count++;
+			}
+			remote_tcal.last_match_ms = now;
+			irq_unlock(key);
+			return;
+		}
+
+		if (incoming.transaction_id == current.transaction_id) {
+			remote_tcal_set_result_locked(&incoming, SK_ESB_HEATED_TCAL_INVALID);
+			irq_unlock(key);
+			return;
+		}
+
+		/* STOP/ABORT may safely supersede a START that has not executed. */
+		if (incoming.action == SK_ESB_HEATED_TCAL_STOP ||
+		    incoming.action == SK_ESB_HEATED_TCAL_ABORT) {
+			irq_unlock(key);
+			remote_tcal_submit_sensor(
+				&incoming,
+				now + REMOTE_TCAL_SENSOR_EXEC_MS,
+				false,
+				generation);
+			return;
+		}
+
+		remote_tcal_set_result_locked(&incoming, SK_ESB_HEATED_TCAL_BUSY);
+		irq_unlock(key);
+		return;
+	}
+
+	/* IDLE: replay the last completed transaction without executing it again. */
+	if (remote_tcal.cached_valid &&
+	    incoming.transaction_id == remote_tcal.cached_payload.transaction_id) {
+		if (remote_tcal_payload_equal(&incoming, &remote_tcal.cached_payload)) {
+			remote_tcal_set_result_with_status_locked(
+				&incoming,
+				remote_tcal.cached_result,
+				remote_tcal.cached_result_status);
+		} else {
+			remote_tcal_set_result_locked(
+				&incoming, SK_ESB_HEATED_TCAL_INVALID);
+		}
+		irq_unlock(key);
+		return;
+	}
+
+	if (incoming.action == SK_ESB_HEATED_TCAL_START) {
+		if (remote_tcal_start_conflicts()) {
+			remote_tcal_set_result_locked(&incoming, SK_ESB_HEATED_TCAL_BUSY);
+		} else {
+			remote_tcal.payload = incoming;
+			remote_tcal.matching_count = 1;
+			remote_tcal.first_rx_ms = now;
+			remote_tcal.last_match_ms = now;
+			remote_tcal.state = REMOTE_TCAL_WAIT_START;
+		}
+		irq_unlock(key);
+		return;
+	}
+	irq_unlock(key);
+	remote_tcal_submit_sensor(
+		&incoming,
+		now + REMOTE_TCAL_SENSOR_EXEC_MS,
+		false,
+		generation);
+}
+
+static void remote_tcal_handle_normal_pong(void)
+{
+	unsigned key = irq_lock();
+	if (remote_tcal.state == REMOTE_TCAL_RESULT_READY) {
+		remote_tcal.state = REMOTE_TCAL_IDLE;
+	} else if (remote_tcal.state == REMOTE_TCAL_WAIT_START) {
+		/*
+		 * Receiver withdrew START before it was confirmed.  Return directly
+		 * to IDLE (NORMAL is already the withdrawal handshake), but remember
+		 * the cancellation so a delayed copy of the same extension PONG
+		 * cannot create a fresh WAIT_START and eventually start heating.
+		 */
+		struct remote_tcal_payload canceled = remote_tcal.payload;
+		remote_tcal_enter_idle_without_handshake_locked(
+			&canceled, true, false);
+	}
+	irq_unlock(key);
+}
+
+static bool remote_tcal_process_safety_preempt(void)
+{
+	unsigned key = irq_lock();
+	enum remote_tcal_safety_preempt_mode mode =
+		remote_tcal.safety_preempt_mode;
+	uint32_t generation = remote_tcal.generation;
+	uint32_t token = remote_tcal.safety_preempt_token;
+	bool submit_in_progress = remote_tcal.safety_preempt_submit_in_progress;
+	struct remote_tcal_payload payload = remote_tcal.safety_preempt_payload;
+	bool payload_valid = remote_tcal.safety_preempt_payload_valid;
+	irq_unlock(key);
+
+	if (mode == REMOTE_TCAL_SAFETY_PREEMPT_NONE) {
+		return false;
+	}
+	if (token == 0) {
+		if (!submit_in_progress) {
+			remote_tcal_request_safety_preempt(
+				mode, payload_valid ? &payload : NULL, payload_valid);
+		}
+		return true;
+	}
+
+	int sensor_result;
+	int poll = sensor_tcal_heated_poll(token, &sensor_result);
+	if (poll == 0) {
+		return true;
+	}
+
+	bool physical_safety_confirmed =
+		poll == 1 &&
+		(sensor_result == 0 ||
+		 sensor_result == -EALREADY ||
+		 sensor_result == -ENOENT ||
+		 sensor_result == -ECANCELED);
+
+	key = irq_lock();
+	bool still_current =
+		remote_tcal.generation == generation &&
+		remote_tcal.safety_preempt_mode == mode &&
+		remote_tcal.safety_preempt_token == token;
+	if (still_current) {
+		if (physical_safety_confirmed) {
+			const struct remote_tcal_payload *result_payload =
+				mode == REMOTE_TCAL_SAFETY_PREEMPT_LEGACY &&
+					payload_valid ?
+					&payload : NULL;
+			remote_tcal_enter_idle_without_handshake_locked(
+				result_payload,
+				mode == REMOTE_TCAL_SAFETY_PREEMPT_LEGACY,
+				mode == REMOTE_TCAL_SAFETY_PREEMPT_PAIRING);
+		} else {
+			/*
+			 * Lost tokens and hardware errors are not proof of zero PWM.
+			 * Release this attempt and retry ABORT on a later sensor cycle.
+			 */
+			remote_tcal.safety_preempt_token = 0;
+		}
+	}
+	irq_unlock(key);
+	return true;
+}
+
+static void remote_tcal_process(void)
+{
+	if (remote_tcal_process_safety_preempt()) {
+		return;
+	}
+
+	int64_t now = k_uptime_get();
+	unsigned key = irq_lock();
+	enum remote_tcal_transport_state state = remote_tcal.state;
+	uint32_t generation = remote_tcal.generation;
+	struct remote_tcal_payload payload = remote_tcal.payload;
+	uint32_t token = remote_tcal.sensor_token;
+	int64_t first_rx = remote_tcal.first_rx_ms;
+	int64_t last_match = remote_tcal.last_match_ms;
+	uint8_t matching_count = remote_tcal.matching_count;
+	int64_t deadline = remote_tcal.execute_deadline_ms;
+	bool cancel_after_abort = remote_tcal.cancel_after_abort;
+	uint8_t abort_override_result = remote_tcal.abort_override_result;
+	irq_unlock(key);
+
+	if (state == REMOTE_TCAL_WAIT_START) {
+		if (now - first_rx >= REMOTE_TCAL_WAIT_MAX_MS) {
+			key = irq_lock();
+			if (remote_tcal.generation == generation &&
+			    remote_tcal.state == REMOTE_TCAL_WAIT_START &&
+			    remote_tcal.first_rx_ms == first_rx &&
+			    remote_tcal.safety_preempt_mode ==
+				    REMOTE_TCAL_SAFETY_PREEMPT_NONE) {
+				remote_tcal_set_result_locked(
+					&payload, SK_ESB_HEATED_TCAL_TIMEOUT);
+			}
+			irq_unlock(key);
+			return;
+		}
+
+		if (matching_count >= 2 &&
+		    now - first_rx >= REMOTE_TCAL_START_CONFIRM_DELAY_MS &&
+		    now - last_match <= REMOTE_TCAL_MATCH_FRESH_MS) {
+			/*
+			 * Revalidate with radio interrupts disabled, then publish the
+			 * sensor request in the same short critical section. This keeps
+			 * a concurrent STOP/ABORT from being overwritten by the START.
+			 */
+			key = irq_lock();
+			if (remote_tcal.generation == generation &&
+			    remote_tcal.state == REMOTE_TCAL_WAIT_START &&
+			    remote_tcal.first_rx_ms == first_rx &&
+			    remote_tcal.matching_count >= 2 &&
+			    now - remote_tcal.last_match_ms <=
+				    REMOTE_TCAL_MATCH_FRESH_MS &&
+			    remote_tcal.safety_preempt_mode ==
+				    REMOTE_TCAL_SAFETY_PREEMPT_NONE) {
+					remote_tcal_submit_sensor(
+						&payload,
+						first_rx + REMOTE_TCAL_WAIT_MAX_MS,
+						false,
+						generation);
+			}
+			irq_unlock(key);
+		}
+		return;
+	}
+
+	if (state != REMOTE_TCAL_SENSOR_EXEC) {
+		return;
+	}
+
+	int sensor_result;
+	int poll = sensor_tcal_heated_poll(token, &sensor_result);
+	if (poll == 1) {
+		key = irq_lock();
+		if (remote_tcal.generation == generation &&
+		    remote_tcal.state == REMOTE_TCAL_SENSOR_EXEC &&
+		    remote_tcal.sensor_token == token &&
+		    remote_tcal.safety_preempt_mode ==
+			    REMOTE_TCAL_SAFETY_PREEMPT_NONE) {
+			struct remote_tcal_payload result_payload = payload;
+			uint8_t result;
+			bool safety_override_safe =
+				sensor_result == 0 ||
+				sensor_result == -EALREADY ||
+				sensor_result == -ENOENT;
+			if (!safety_override_safe) {
+				if (remote_tcal.result_override_pending) {
+					result_payload = remote_tcal.result_override_payload;
+				}
+				result = remote_tcal_map_errno(sensor_result);
+			} else if (remote_tcal.result_override_pending) {
+				result_payload = remote_tcal.result_override_payload;
+				result = remote_tcal.result_override;
+			} else if (remote_tcal.cancel_after_abort) {
+				result = remote_tcal.abort_override_result;
+			} else {
+				result = remote_tcal_map_errno(sensor_result);
+			}
+			remote_tcal.cancel_after_abort = false;
+			remote_tcal_set_result_locked(&result_payload, result);
+		}
+		irq_unlock(key);
+	} else if (poll < 0) {
+		/*
+		 * A safety upgrade should normally keep the old token as an alias.
+		 * Recover defensively if a token is nevertheless lost: never leave the
+		 * transport permanently in SENSOR_EXEC, and never publish START
+		 * failure before a serialized ABORT has run.
+		 */
+		if (cancel_after_abort) {
+			(void)remote_tcal_abort_then_result(
+				&payload, abort_override_result, generation);
+		} else if (payload.action == SK_ESB_HEATED_TCAL_STOP ||
+			   payload.action == SK_ESB_HEATED_TCAL_ABORT) {
+			remote_tcal_submit_sensor(
+				&payload,
+				now + REMOTE_TCAL_SENSOR_EXEC_MS,
+				true,
+				generation);
+		} else {
+			(void)remote_tcal_abort_then_result(
+				&payload, SK_ESB_HEATED_TCAL_INTERNAL, generation);
+		}
+	} else if (now >= deadline &&
+		   payload.action == SK_ESB_HEATED_TCAL_START &&
+		   !cancel_after_abort) {
+		/*
+		 * Never publish a START timeout while a late sensor action could
+		 * still leave the heater active. Serialize ABORT first, then expose
+		 * TIMEOUT. STOP/ABORT themselves remain pending until the sensor
+		 * thread has actually made the heater safe.
+		 */
+		(void)remote_tcal_abort_then_result(
+			&payload, SK_ESB_HEATED_TCAL_TIMEOUT, generation);
+	}
+}
+#endif /* CONFIG_SK_REMOTE_HEATED_TCAL_TEST */
 
 
 typedef void (*esb_remote_cmd_fn)(void);
@@ -338,13 +1344,22 @@ static void esb_remote_cmd_clear_channel(void)
 static void esb_remote_cmd_sens_set(void)
 {
 	LOG_INF("Executing remote command: SENS_SET");
-	cmd_sens_set(received_sens_data[0], received_sens_data[1], received_sens_data[2]);
+	int err = cmd_sens_set(
+		received_sens_data[0],
+		received_sens_data[1],
+		received_sens_data[2]);
+	if (err) {
+		LOG_WRN("Remote SENS_SET rejected: %d", err);
+	}
 }
 
 static void esb_remote_cmd_sens_reset(void)
 {
 	LOG_INF("Executing remote command: SENS_RESET");
-	cmd_sens_reset();
+	int err = cmd_sens_reset();
+	if (err) {
+		LOG_WRN("Remote SENS_RESET rejected: %d", err);
+	}
 }
 
 static void esb_remote_cmd_sens_auto(void)
@@ -385,7 +1400,10 @@ static void esb_remote_cmd_tcal_auto_on(void)
 {
 #if CONFIG_SENSOR_USE_TCAL
 	LOG_INF("Executing remote command: TCAL_AUTO_ON");
-	sensor_tcal_set_auto_calibration(true);
+	int err = sensor_tcal_set_auto_calibration(true);
+	if (err) {
+		LOG_WRN("Remote TCAL_AUTO_ON rejected: %d", err);
+	}
 #else
 	LOG_WRN("Remote command: TCAL_AUTO_ON not supported (T-Cal disabled in config)");
 #endif
@@ -395,7 +1413,10 @@ static void esb_remote_cmd_tcal_auto_off(void)
 {
 #if CONFIG_SENSOR_USE_TCAL
 	LOG_INF("Executing remote command: TCAL_AUTO_OFF");
-	sensor_tcal_set_auto_calibration(false);
+	int err = sensor_tcal_set_auto_calibration(false);
+	if (err) {
+		LOG_WRN("Remote TCAL_AUTO_OFF rejected: %d", err);
+	}
 #else
 	LOG_WRN("Remote command: TCAL_AUTO_OFF not supported (T-Cal disabled in config)");
 #endif
@@ -595,17 +1616,29 @@ static void remote_print_meow(void)
 }
 
 
-static void esb_remote_command_execute(uint8_t cmd)
+static bool esb_remote_command_execute(uint8_t cmd)
 {
+#if CONFIG_SK_REMOTE_HEATED_TCAL_TEST
+	if (remote_tcal_is_critical_legacy_command(cmd) &&
+	    sensor_tcal_heated_is_active()) {
+		int abort_err = sensor_tcal_heated_abort();
+		if (abort_err && abort_err != -EALREADY) {
+			LOG_WRN("Deferring critical command 0x%02X; heater abort failed: %d",
+				cmd, abort_err);
+			return false;
+		}
+	}
+#endif
 	for (size_t i = 0; i < ARRAY_SIZE(esb_remote_cmds); i++) {
 		if (esb_remote_cmds[i].flag == cmd) {
 			if (esb_remote_cmds[i].fn) {
 				esb_remote_cmds[i].fn();
 			}
-			return;
+			return true;
 		}
 	}
 	LOG_WRN("Unknown remote command: 0x%02X", cmd);
+	return true;
 }
 
 
@@ -1052,11 +2085,20 @@ void event_handler(struct esb_evt const *event)
 
 					// Check flags field (byte 7)
 					uint8_t pong_flags = rx_payload.data[7];
+#if CONFIG_SK_REMOTE_HEATED_TCAL_TEST
+					bool remote_tcal_pong = pong_flags == SK_ESB_EXT_ESCAPE;
+#endif
 					uint32_t rtt_us = 0;
 					float pong_sens_data[3] = {0.0f, 0.0f, 0.0f};
 					uint8_t pong_sens_auto_axis = 0;
 					uint16_t pong_sens_auto_revolutions = 0;
 
+#if CONFIG_SK_REMOTE_HEATED_TCAL_TEST
+					if (remote_tcal_pong) {
+						/* Extension bytes 3..6 are command data, never time sync. */
+						remote_tcal_handle_pong(rx_payload.data);
+					} else
+#endif
 					if (pong_flags == ESB_PONG_FLAG_SENS_SET) {
 						// Special case: SENS_SET command repurposes time sync bytes for data
 						// Skip time sync update
@@ -1281,7 +2323,18 @@ void event_handler(struct esb_evt const *event)
 					}
 
 					// handle remote commands and delayed execution
+#if CONFIG_SK_REMOTE_HEATED_TCAL_TEST
+					if (remote_tcal_pong) {
+						/* Fully isolated from the legacy flag/echo state machine. */
+					} else
+#endif
 					if (pong_flags != ESB_PONG_FLAG_NORMAL) {
+#if CONFIG_SK_REMOTE_HEATED_TCAL_TEST
+						if (remote_tcal_defer_legacy_command(pong_flags)) {
+							/* Keep the legacy command pending at the receiver. */
+							break;
+						}
+#endif
 						if (received_remote_command == ESB_PONG_FLAG_NORMAL ||
 						    (received_remote_command == acked_remote_command &&
 						     pong_flags != received_remote_command)) {
@@ -1326,6 +2379,9 @@ void event_handler(struct esb_evt const *event)
 						}
 					} else {
 						// received NORMAL flag, indicates the receiver has confirmed our echo
+#if CONFIG_SK_REMOTE_HEATED_TCAL_TEST
+						remote_tcal_handle_normal_pong();
+#endif
 						if (acked_remote_command != ESB_PONG_FLAG_NORMAL) {
 							LOG_DBG("Receiver confirmed command 0x%02X, resetting state", acked_remote_command);
 							received_remote_command = ESB_PONG_FLAG_NORMAL;
@@ -1602,6 +2658,10 @@ void esb_pair(void)
 		set_led(SYS_LED_PATTERN_SHORT, SYS_LED_PRIORITY_CONNECTION);
 		int64_t pair_start_time = k_uptime_get();
 		while (paired_addr[0] != checksum && ((*(uint64_t *)&paired_addr[0] >> 16) & 0xFFFFFFFFFFFF) != *addr) {
+#if CONFIG_SK_REMOTE_HEATED_TCAL_TEST
+			/* Pairing can block this thread; keep retrying/polling the safety ABORT. */
+			remote_tcal_process();
+#endif
 			if (!esb_initialized) {
 				esb_set_addr_discovery();
 				esb_initialize(true);
@@ -1668,6 +2728,9 @@ void esb_pair(void)
 
 void esb_reset_pair(void)
 {
+#if CONFIG_SK_REMOTE_HEATED_TCAL_TEST
+	remote_tcal_reset_for_pairing();
+#endif
 	if (paired_addr[0] || esb_paired) {
 		esb_deinitialize(); // make sure esb is off
 		esb_paired = false;
@@ -1966,6 +3029,40 @@ uint8_t esb_get_ping_ack_flag(void)
 	return ESB_PONG_FLAG_NORMAL;
 }
 
+void esb_prepare_ping_extension(uint8_t ping[ESB_PING_LEN])
+{
+#if CONFIG_SK_REMOTE_HEATED_TCAL_TEST
+	unsigned key = irq_lock();
+	enum remote_tcal_transport_state state = remote_tcal.state;
+	struct remote_tcal_payload payload = remote_tcal.payload;
+	uint8_t result = remote_tcal.result;
+	uint8_t result_status = remote_tcal.result_status;
+	irq_unlock(key);
+
+	if (state == REMOTE_TCAL_RESULT_READY) {
+		ping[SK_ESB_EXT_FLAG_OFFSET] = SK_ESB_EXT_ESCAPE;
+		sys_put_be16(
+			payload.transaction_id,
+			&ping[SK_ESB_EXT_TRANSACTION_OFFSET]);
+		ping[SK_ESB_EXT_PING_RESULT_OFFSET] =
+			SK_ESB_HEATED_TCAL_RESULT_MARKER | (result & 0x0f);
+		ping[SK_ESB_EXT_PING_STATUS_OFFSET] = result_status;
+		return;
+	}
+
+	/* Capability/status is advertised only in an otherwise NORMAL PING. */
+	if (ping[SK_ESB_EXT_FLAG_OFFSET] == ESB_PONG_FLAG_NORMAL) {
+		ping[SK_ESB_EXT_PING_MAGIC_0_OFFSET] = SK_ESB_EXT_MAGIC_0;
+		ping[SK_ESB_EXT_PING_MAGIC_1_OFFSET] = SK_ESB_EXT_MAGIC_1;
+		ping[SK_ESB_EXT_PING_VERSION_OFFSET] = SK_ESB_EXT_VERSION;
+		ping[SK_ESB_EXT_PING_STATUS_OFFSET] =
+			sensor_tcal_heated_status_snapshot();
+	}
+#else
+	ARG_UNUSED(ping);
+#endif
+}
+
 uint64_t esb_get_server_time_ticks_64(void)
 {
 	if (!server_time_synced) {
@@ -2028,6 +3125,9 @@ static void esb_thread(void)
 	clock_init_external_async();
 
 	while (1) {
+#if CONFIG_SK_REMOTE_HEATED_TCAL_TEST
+		remote_tcal_process();
+#endif
 #if CONFIG_CONNECTION_OVER_HID
 		if (!esb_paired && get_status(SYS_STATUS_USB_CONNECTED) == false
 			&& k_uptime_get() - 750 > start_time) // only automatically enter pairing while not
@@ -2069,7 +3169,11 @@ static void esb_thread(void)
 			bool is_ota_cmd = (received_remote_command >= ESB_PONG_FLAG_OTA_QUERY_INFO &&
 					   received_remote_command <= ESB_PONG_FLAG_OTA_UNSUPPRESS);
 			if (is_ota_cmd || now_idle - remote_command_receive_time >= REMOTE_COMMAND_DELAY_MS) {
-				esb_remote_command_execute(received_remote_command);
+				if (!esb_remote_command_execute(received_remote_command)) {
+					remote_command_receive_time = now_idle;
+					k_msleep(10);
+					continue;
+				}
 
 				acked_remote_command = received_remote_command;
 

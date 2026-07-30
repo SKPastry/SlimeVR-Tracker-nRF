@@ -446,6 +446,19 @@ void sys_clear(void)
 		reset_confirm = true;
 		return;
 	}
+
+	/*
+	 * The second invocation performs the destructive retained/NVS mutation.
+	 * Serialize it with every calibration writer so an active Heated T-Cal
+	 * cannot merge staged points back into freshly-cleared state.
+	 */
+	int calibration_err = sensor_calibration_mutation_claim();
+	if (calibration_err) {
+		printk("Reset canceled: calibration data is busy (%d).\n",
+		       calibration_err);
+		reset_confirm = false;
+		return;
+	}
 	printk("Resetting NVS and retained\n");
 
 	sys_nvs_init();
@@ -461,6 +474,7 @@ void sys_clear(void)
 	retained->gyroSensScale[2] = 1.0f;
 	retained->build_timestamp = BUILD_TIMESTAMP;
 	retained_update();
+	sensor_calibration_mutation_release();
 
 	LOG_INF("NVS and retained reset");
 }

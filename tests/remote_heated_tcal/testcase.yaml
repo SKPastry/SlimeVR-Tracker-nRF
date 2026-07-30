@@ -1,0 +1,9 @@
+tests:
+  tracker.remote_heated_tcal.contract:
+    platform_allow:
+      - native_sim/native/64
+    integration_platforms:
+      - native_sim/native/64
+    tags:
+      - protocol
+      - remote_heated_tcal

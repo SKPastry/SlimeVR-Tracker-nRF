@@ -26,6 +26,8 @@
 #include <esb.h>
 #include <nrfx_timer.h>
 
+#include "remote_tcal_protocol.h"
+
 // TODO: timer?
 #define LAST_RESET_LIMIT 10
 extern uint8_t last_reset;
@@ -149,6 +151,9 @@ bool esb_ready(void);
 
 // Get remote command flag to echo back in PING
 uint8_t esb_get_ping_ack_flag(void);
+
+/* Fill bytes 7..11 with either the experimental result or NORMAL capability. */
+void esb_prepare_ping_extension(uint8_t ping[ESB_PING_LEN]);
 
 // Additional delay applied to the base ping interval after repeated failures.
 uint32_t esb_get_ping_backoff_ms(void);

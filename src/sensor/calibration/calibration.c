@@ -60,6 +60,17 @@ float magBAinv[4][3];
 
 K_MUTEX_DEFINE(calibration_request_lock);
 static int requested_calibration;
+/* Heated T-Cal owns calibration independently; the calibration thread must
+ * never consume it as a normal request ID. */
+static bool heated_calibration_owner;
+/*
+ * PWM-off failures transfer HEATED ownership here before it is released.
+ * This is not an active calibration owner: it is a hardware safety barrier
+ * that blocks every new calibration until a checked zero write succeeds.
+ */
+static bool heated_hardware_safety_interlock;
+/* Prevent a Heated claim from racing a retained/live calibration mutation. */
+static bool calibration_mutation_owner;
 static K_SEM_DEFINE(calibration_wake_sem, 0, 1);
 
 /* Also occupies request slot so IMU/TCal/sens cannot overlap magneto_progress collection. */
@@ -71,6 +82,97 @@ static bool mag_cal_led_pending;
 static void calibration_signal_wake(void)
 {
 	k_sem_give(&calibration_wake_sem);
+}
+
+int sensor_calibration_heated_claim(void)
+{
+	int result = 0;
+
+	k_mutex_lock(&calibration_request_lock, K_FOREVER);
+	if (heated_calibration_owner || heated_hardware_safety_interlock ||
+	    calibration_mutation_owner || requested_calibration != 0 ||
+	    (magneto_progress & 0x80) || mag_cal_led_pending) {
+		result = -EBUSY;
+	} else {
+		heated_calibration_owner = true;
+	}
+	k_mutex_unlock(&calibration_request_lock);
+	return result;
+}
+
+void sensor_calibration_heated_release(void)
+{
+	k_mutex_lock(&calibration_request_lock, K_FOREVER);
+	heated_calibration_owner = false;
+	k_mutex_unlock(&calibration_request_lock);
+	calibration_signal_wake();
+}
+
+void sensor_calibration_heated_release_faulted(void)
+{
+	k_mutex_lock(&calibration_request_lock, K_FOREVER);
+	heated_calibration_owner = false;
+	heated_hardware_safety_interlock = true;
+	k_mutex_unlock(&calibration_request_lock);
+	calibration_signal_wake();
+}
+
+void sensor_calibration_heated_safety_clear(void)
+{
+	k_mutex_lock(&calibration_request_lock, K_FOREVER);
+	heated_hardware_safety_interlock = false;
+	k_mutex_unlock(&calibration_request_lock);
+	calibration_signal_wake();
+}
+
+bool sensor_calibration_heated_is_owner(void)
+{
+	bool owned;
+
+	k_mutex_lock(&calibration_request_lock, K_FOREVER);
+	owned = heated_calibration_owner;
+	k_mutex_unlock(&calibration_request_lock);
+	return owned;
+}
+
+static int calibration_mutation_claim_internal(bool require_idle)
+{
+	int result = 0;
+
+	k_mutex_lock(&calibration_request_lock, K_FOREVER);
+	if (heated_calibration_owner || heated_hardware_safety_interlock ||
+	    calibration_mutation_owner ||
+	    (require_idle && (requested_calibration != 0 ||
+			      (magneto_progress & 0x80) || mag_cal_led_pending))) {
+		result = -EBUSY;
+	} else {
+		calibration_mutation_owner = true;
+	}
+	k_mutex_unlock(&calibration_request_lock);
+	return result;
+}
+
+int sensor_calibration_mutation_claim(void)
+{
+	return calibration_mutation_claim_internal(true);
+}
+
+void sensor_calibration_mutation_release(void)
+{
+	k_mutex_lock(&calibration_request_lock, K_FOREVER);
+	calibration_mutation_owner = false;
+	k_mutex_unlock(&calibration_request_lock);
+	calibration_signal_wake();
+}
+
+static int calibration_pending_request_get(void)
+{
+	int requested;
+
+	k_mutex_lock(&calibration_request_lock, K_FOREVER);
+	requested = requested_calibration;
+	k_mutex_unlock(&calibration_request_lock);
+	return requested;
 }
 
 #if CONFIG_SENSOR_USE_SENS_CALIBRATION
@@ -309,6 +411,10 @@ int sensor_calibration_validate_mag(float m_inv[][3], bool write)
 
 void sensor_calibration_clear(float *a_bias, float *g_bias, bool write)
 {
+	if (calibration_mutation_claim_internal(false) != 0) {
+		LOG_WRN("Calibration clear rejected while heated T-Cal owns calibration");
+		return;
+	}
 	if (a_bias == NULL) {
 		a_bias = accelBias;
 	}
@@ -332,13 +438,18 @@ void sensor_calibration_clear(float *a_bias, float *g_bias, bool write)
 		// Note: Caller is responsible for calling sensor_fusion_update_bias() or
 		// sensor_fusion_invalidate() as appropriate:
 		// - sensor_fusion_update_bias(): for internal/automatic calibration (preserves quaternion)
-		// - sensor_fusion_invalidate(): for manual reset commands (resets quaternion)
+			// - sensor_fusion_invalidate(): for manual reset commands (resets quaternion)
 	}
+	sensor_calibration_mutation_release();
 }
 
 #if CONFIG_SENSOR_USE_6_SIDE_CALIBRATION
 void sensor_calibration_clear_6_side(float a_inv[][3], bool write)
 {
+	if (calibration_mutation_claim_internal(false) != 0) {
+		LOG_WRN("Six-side calibration clear rejected while heated T-Cal owns calibration");
+		return;
+	}
 	if (a_inv == NULL) {
 		a_inv = accBAinv;
 	}
@@ -350,11 +461,16 @@ void sensor_calibration_clear_6_side(float a_inv[][3], bool write)
 		LOG_INF("Clearing stored calibration data");
 		sys_write(MAIN_ACC_6_BIAS_ID, &retained->accBAinv, a_inv, sizeof(accBAinv));
 	}
+	sensor_calibration_mutation_release();
 }
 #endif
 
 void sensor_calibration_clear_mag(float m_inv[][3], bool write)
 {
+	if (calibration_mutation_claim_internal(false) != 0) {
+		LOG_WRN("Mag calibration clear rejected while heated T-Cal owns calibration");
+		return;
+	}
 	bool clearing_live_state = (m_inv == NULL || m_inv == magBAinv);
 	if (m_inv == NULL) {
 		m_inv = magBAinv;
@@ -373,6 +489,7 @@ void sensor_calibration_clear_mag(float m_inv[][3], bool write)
 		sys_write(MAIN_MAG_BIAS_ID, &retained->magBAinv, m_inv, sizeof(magBAinv));
 		sensor_refresh_sensor_ids(); // Refresh reported mag status after clear
 	}
+	sensor_calibration_mutation_release();
 }
 
 void sensor_request_calibration(void)
@@ -395,7 +512,9 @@ int sensor_request_calibration_sens(uint8_t axis, uint16_t revolutions)
 	}
 
 	k_mutex_lock(&calibration_request_lock, K_FOREVER);
-	if (requested_calibration != 0 || (magneto_progress & 0x80)) {
+	if (heated_calibration_owner || heated_hardware_safety_interlock ||
+	    calibration_mutation_owner || requested_calibration != 0 ||
+	    (magneto_progress & 0x80)) {
 		k_mutex_unlock(&calibration_request_lock);
 		LOG_ERR("Sensor calibration is already running");
 		return -1;
@@ -413,6 +532,12 @@ int sensor_request_calibration_sens(uint8_t axis, uint16_t revolutions)
 void sensor_request_calibration_mag(void)
 {
 	k_mutex_lock(&calibration_request_lock, K_FOREVER);
+	if (heated_calibration_owner || heated_hardware_safety_interlock ||
+	    calibration_mutation_owner) {
+		k_mutex_unlock(&calibration_request_lock);
+		LOG_WRN("Magnetometer calibration rejected while heated T-Cal owns calibration");
+		return;
+	}
 	if (magneto_progress & 0x80 || mag_cal_led_pending) {
 		k_mutex_unlock(&calibration_request_lock);
 		if (!get_status(SYS_STATUS_CALIBRATION_RUNNING)) {
@@ -450,10 +575,15 @@ int sensor_calibration_request(int id)
 		result = 0;
 		break;
 	case 0:
-		result = requested_calibration;
+		result = (heated_calibration_owner ||
+			  heated_hardware_safety_interlock ||
+			  calibration_mutation_owner) ?
+			-EBUSY : requested_calibration;
 		break;
 	default:
-		if (requested_calibration != 0 || (magneto_progress & 0x80)) {
+		if (heated_calibration_owner || heated_hardware_safety_interlock ||
+		    calibration_mutation_owner || requested_calibration != 0 ||
+		    (magneto_progress & 0x80)) {
 			LOG_ERR("Sensor calibration is already running");
 			result = -1;
 		} else {
@@ -538,7 +668,7 @@ static void calibration_thread(void)
 
 	// requested calibrations run here
 	while (1) {
-		int requested = sensor_calibration_request(0);
+		int requested = calibration_pending_request_get();
 		switch (requested) {
 		case 1:
 			set_status(SYS_STATUS_CALIBRATION_RUNNING, true);
@@ -621,7 +751,7 @@ static void calibration_thread(void)
 #endif
 
 		// Phase 2: Background online magnetometer calibration check
-		if (requested == 0) {
+		if (requested == 0 && !sensor_calibration_heated_is_owner()) {
 			sensor_calibration_online_mag_check();
 		}
 
@@ -770,7 +900,7 @@ void sensor_tcal_status(void)
 // Public function for 'tcal clear' and 'reset tcal'
 void sensor_tcal_clear(void)
 {
-	if (sensor_calibration_request(0) != 0) {
+	if (sensor_calibration_mutation_claim() != 0) {
 		LOG_ERR("Another calibration is running. Cannot clear T-Cal data.");
 		printk("Error: Another calibration is running.\n");
 		return;
@@ -823,19 +953,20 @@ void sensor_tcal_clear(void)
 	sensor_fusion_invalidate();
 
 	printk("All temperature calibration data and D_offset have been cleared.\n");
+	sensor_calibration_mutation_release();
 }
 
 // Public function for 'tcal remove <index>'
 void sensor_tcal_remove_point(int index_to_remove)
 {
-	if (sensor_calibration_request(0) != 0) {
-		LOG_ERR("Another calibration is running. Cannot remove T-Cal point.");
-		printk("Error: Another calibration is running.\n");
+	if (index_to_remove < 0 || index_to_remove >= TCAL_BUFFER_SIZE) {
+		printk("Error: Index %d is out of valid range (0 to %d).\n", index_to_remove, TCAL_BUFFER_SIZE - 1);
 		return;
 	}
 
-	if (index_to_remove < 0 || index_to_remove >= TCAL_BUFFER_SIZE) {
-		printk("Error: Index %d is out of valid range (0 to %d).\n", index_to_remove, TCAL_BUFFER_SIZE - 1);
+	if (sensor_calibration_mutation_claim() != 0) {
+		LOG_ERR("Another calibration is running. Cannot remove T-Cal point.");
+		printk("Error: Another calibration is running.\n");
 		return;
 	}
 
@@ -866,6 +997,7 @@ void sensor_tcal_remove_point(int index_to_remove)
 	} else {
 		printk("No data found at index %d. Nothing to remove.\n", index_to_remove);
 	}
+	sensor_calibration_mutation_release();
 }
 
 // Check if current temperature needs calibration (missing nearby calibration point)

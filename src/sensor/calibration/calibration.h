@@ -65,6 +65,10 @@ void sensor_calibration_online_mag_retained_save(void);
 void sensor_calibration_online_mag_retained_clear(void);
 void sensor_calibration_online_mag_cold_start(void);
 
+/* Short-lived ownership for retained/live calibration mutations. */
+int sensor_calibration_mutation_claim(void);
+void sensor_calibration_mutation_release(void);
+
 #if CONFIG_SENSOR_USE_TCAL
 
 // Quality assessment structure for T-Cal
@@ -85,7 +89,7 @@ void sensor_tcal_status(void);
 void sensor_tcal_remove_point(int index_to_remove);
 bool sensor_tcal_is_temp_outside_range(float temp, float *min_temp, float *max_temp);
 void sensor_tcal_check_auto_calibration(float current_temp);
-void sensor_tcal_set_auto_calibration(bool enabled);
+int sensor_tcal_set_auto_calibration(bool enabled);
 bool sensor_tcal_get_auto_calibration(void);
 
 // T-Cal compensation enable/disable (persisted)
@@ -110,15 +114,40 @@ void sensor_tcal_feed_continuous_sample(const float g[3], float temp);
 void sensor_tcal_continuous_motion_detected(void);
 
 #if CONFIG_SENSOR_TCAL_HEATED
+typedef enum {
+	SENSOR_TCAL_HEATED_CMD_START = 1,
+	SENSOR_TCAL_HEATED_CMD_STOP = 2,
+	SENSOR_TCAL_HEATED_CMD_ABORT = 3,
+	SENSOR_TCAL_HEATED_CMD_DUTY = 4,
+	SENSOR_TCAL_HEATED_CMD_TUNE_KP = 5,
+	SENSOR_TCAL_HEATED_CMD_TUNE_KI = 6,
+	SENSOR_TCAL_HEATED_CMD_TUNE_KFF = 7,
+} sensor_tcal_heated_cmd_t;
+
 bool sensor_tcal_heated_is_active(void);
 int sensor_tcal_heated_start(float target_temp);
-void sensor_tcal_heated_stop(void);
-void sensor_tcal_heated_abort(void);
+int sensor_tcal_heated_stop(void);
+int sensor_tcal_heated_abort(void);
 void sensor_tcal_heated_update(bool is_resting);
 void sensor_tcal_heated_status(void);
 int sensor_tcal_heated_tune(const char *param, float value);
 int sensor_tcal_heated_set_open_loop_duty(uint16_t duty_pptt);
+int sensor_tcal_heated_submit(sensor_tcal_heated_cmd_t command, float value,
+			      int64_t deadline_ms, uint32_t *token);
+int sensor_tcal_heated_submit_detached(sensor_tcal_heated_cmd_t command, float value,
+				       int64_t deadline_ms);
+int sensor_tcal_heated_poll(uint32_t token, int *result);
+void sensor_tcal_heated_abandon(uint32_t token);
+void sensor_tcal_heated_process_mailbox(void);
+uint8_t sensor_tcal_heated_status_snapshot(void);
 #endif
+
+/* Independent ownership for heated T-Cal; never consumed as a request ID. */
+int sensor_calibration_heated_claim(void);
+void sensor_calibration_heated_release(void);
+void sensor_calibration_heated_release_faulted(void);
+void sensor_calibration_heated_safety_clear(void);
+bool sensor_calibration_heated_is_owner(void);
 
 // Quality assessment function - returns true if quality is sufficient
 bool sensor_tcal_assess_quality(float current_temp, tcal_quality_t *quality);

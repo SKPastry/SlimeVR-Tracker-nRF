@@ -667,7 +667,7 @@ static void print_help(void)
 	// Update the help string to show the new command set
 	printk("  tcal <on|off|status|dump|test temp|remove index|auto on|auto off> Temperature calibration\n");
 #if CONFIG_SENSOR_TCAL_HEATED
-	printk("  tcal heat <start [temp]|stop|status|duty pptt|tune kp|ki|kff value> Heated T-Cal\n");
+	printk("  tcal heat <start [temp]|stop|abort|status|duty pptt|tune kp|ki|kff value> Heated T-Cal\n");
 #endif
 #endif
 	printk("\n");
@@ -724,68 +724,91 @@ static void print_help(void)
 
 // --- Command Implementations ---
 
-void cmd_sens_set(float x, float y, float z)
+int cmd_sens_set(float x, float y, float z)
 {
 #if CONFIG_SENSOR_USE_SENS_CALIBRATION
-	if (retained) {
-		float deg_x = x;
-		float deg_y = y;
-		float deg_z = z;
-
-		float den_x = 1.0f - (deg_x / (360.0f * CONFIG_SENSOR_SENS_REV));
-		float den_y = 1.0f - (deg_y / (360.0f * CONFIG_SENSOR_SENS_REV));
-		float den_z = 1.0f - (deg_z / (360.0f * CONFIG_SENSOR_SENS_REV));
-
-		// Prevent division by zero or near-zero
-		if (fabsf(den_x) < 1e-6f || fabsf(den_y) < 1e-6f || fabsf(den_z) < 1e-6f) {
-			printk("Error: Invalid input degrees leading to division by zero. Calibration not applied.\n");
-		} else {
-			retained->gyroSensScale[0] = 1.0f / den_x;
-			retained->gyroSensScale[1] = 1.0f / den_y;
-			retained->gyroSensScale[2] = 1.0f / den_z;
-			retained_update();
-			sys_write(
-				MAIN_GYRO_SENS_ID,
-				&retained->gyroSensScale,
-				retained->gyroSensScale,
-				sizeof(retained->gyroSensScale)
-			);
-			printk(
-				"Gyro sensitivity difference set to: %.3f, %.3f, %.3f\n",
-				(double)deg_x,
-				(double)deg_y,
-				(double)deg_z
-			);
-		}
-	} else {
+	if (!retained) {
 		printk("Error: Retained data not available.\n");
+		return -ENODEV;
 	}
+
+	float deg_x = x;
+	float deg_y = y;
+	float deg_z = z;
+	float den_x = 1.0f - (deg_x / (360.0f * CONFIG_SENSOR_SENS_REV));
+	float den_y = 1.0f - (deg_y / (360.0f * CONFIG_SENSOR_SENS_REV));
+	float den_z = 1.0f - (deg_z / (360.0f * CONFIG_SENSOR_SENS_REV));
+
+	// Prevent division by zero or near-zero
+	if (fabsf(den_x) < 1e-6f || fabsf(den_y) < 1e-6f ||
+	    fabsf(den_z) < 1e-6f) {
+		printk("Error: Invalid input degrees leading to division by zero. Calibration not applied.\n");
+		return -EINVAL;
+	}
+
+	int err = sensor_calibration_mutation_claim();
+	if (err) {
+		printk("Error: Another calibration owns sensitivity data (%d).\n",
+		       err);
+		return err;
+	}
+
+	retained->gyroSensScale[0] = 1.0f / den_x;
+	retained->gyroSensScale[1] = 1.0f / den_y;
+	retained->gyroSensScale[2] = 1.0f / den_z;
+	retained_update();
+	sys_write(
+		MAIN_GYRO_SENS_ID,
+		&retained->gyroSensScale,
+		retained->gyroSensScale,
+		sizeof(retained->gyroSensScale)
+	);
+	sensor_calibration_mutation_release();
+	printk(
+		"Gyro sensitivity difference set to: %.3f, %.3f, %.3f\n",
+		(double)deg_x,
+		(double)deg_y,
+		(double)deg_z
+	);
+	return 0;
 #else
 	printk("Error: Sensitivity calibration not enabled.\n");
+	return -ENOTSUP;
 #endif
 }
 
-void cmd_sens_reset(void)
+int cmd_sens_reset(void)
 {
 #if CONFIG_SENSOR_USE_SENS_CALIBRATION
-	if (retained) {
-		printk("Resetting gyro sensitivity calibration.\n");
-		retained->gyroSensScale[0] = 1.0f;
-		retained->gyroSensScale[1] = 1.0f;
-		retained->gyroSensScale[2] = 1.0f;
-		retained_update(); // Save changes
-		sys_write(
-			MAIN_GYRO_SENS_ID,
-			&retained->gyroSensScale,
-			retained->gyroSensScale,
-			sizeof(retained->gyroSensScale)
-		);
-		printk("Gyro sensitivity reset.\n");
-	} else {
+	if (!retained) {
 		printk("Error: Retained data not available.\n");
+		return -ENODEV;
 	}
+
+	int err = sensor_calibration_mutation_claim();
+	if (err) {
+		printk("Error: Another calibration owns sensitivity data (%d).\n",
+		       err);
+		return err;
+	}
+
+	printk("Resetting gyro sensitivity calibration.\n");
+	retained->gyroSensScale[0] = 1.0f;
+	retained->gyroSensScale[1] = 1.0f;
+	retained->gyroSensScale[2] = 1.0f;
+	retained_update(); // Save changes
+	sys_write(
+		MAIN_GYRO_SENS_ID,
+		&retained->gyroSensScale,
+		retained->gyroSensScale,
+		sizeof(retained->gyroSensScale)
+	);
+	sensor_calibration_mutation_release();
+	printk("Gyro sensitivity reset.\n");
+	return 0;
 #else
 	printk("Error: Sensitivity calibration not enabled.\n");
+	return -ENOTSUP;
 #endif
 }
 
@@ -1100,8 +1123,19 @@ static void console_cmd_tcal(size_t argc, char **argv)
 					printk("Heated T-Cal started.\n");
 				}
 			} else if (strcmp(heat_arg, "stop") == 0) {
-				sensor_tcal_heated_stop();
-				printk("Heated T-Cal stopped.\n");
+				int err = sensor_tcal_heated_stop();
+				if (err) {
+					printk("Error: Heated T-Cal stop failed (%d).\n", err);
+				} else {
+					printk("Heated T-Cal stopped.\n");
+				}
+			} else if (strcmp(heat_arg, "abort") == 0) {
+				int err = sensor_tcal_heated_abort();
+				if (err) {
+					printk("Error: Heated T-Cal abort failed (%d).\n", err);
+				} else {
+					printk("Heated T-Cal aborted; staged data discarded.\n");
+				}
 			} else if (strcmp(heat_arg, "duty") == 0) {
 				char *duty_str = argc > 3 ? argv[3] : NULL;
 				if (duty_str == NULL) {
@@ -1141,7 +1175,7 @@ static void console_cmd_tcal(size_t argc, char **argv)
 				}
 			} else {
 				printk(
-					"Error: Invalid heat command '%s'. Use: tcal heat <start [temp]|stop|status|duty pptt|tune kp|ki|kff value>\n",
+					"Error: Invalid heat command '%s'. Use: tcal heat <start [temp]|stop|abort|status|duty pptt|tune kp|ki|kff value>\n",
 					heat_arg
 				);
 			}
@@ -1154,12 +1188,22 @@ static void console_cmd_tcal(size_t argc, char **argv)
 			if (auto_arg == NULL) {
 				printk("Error: Missing argument. Use: tcal auto <on|off>\n");
 			} else if (strcmp(auto_arg, "on") == 0) {
-				sensor_tcal_set_auto_calibration(true);
-				printk("T-Cal auto-calibration enabled. Device will auto-calibrate when resting.\n");
-				printk("Note: Sleep timeout will be prevented during auto-calibration mode.\n");
+				int err = sensor_tcal_set_auto_calibration(true);
+				if (err) {
+					printk("Error: T-Cal auto-calibration change rejected (%d).\n",
+					       err);
+				} else {
+					printk("T-Cal auto-calibration enabled. Device will auto-calibrate when resting.\n");
+					printk("Note: Sleep timeout will be prevented during auto-calibration mode.\n");
+				}
 			} else if (strcmp(auto_arg, "off") == 0) {
-				sensor_tcal_set_auto_calibration(false);
-				printk("T-Cal auto-calibration disabled.\n");
+				int err = sensor_tcal_set_auto_calibration(false);
+				if (err) {
+					printk("Error: T-Cal auto-calibration change rejected (%d).\n",
+					       err);
+				} else {
+					printk("T-Cal auto-calibration disabled.\n");
+				}
 			} else {
 				printk("Error: Invalid argument '%s'. Use: tcal auto <on|off>\n", auto_arg);
 			}

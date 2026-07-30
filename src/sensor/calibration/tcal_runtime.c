@@ -32,7 +32,9 @@
 #include <errno.h>
 #include <math.h>
 #include <string.h>
+#include <zephyr/sys/atomic.h>
 
+#include "connection/remote_tcal_protocol.h"
 #include "bias_collect.h"
 #include "calibration.h"
 #include "tcal_mls_lut.h"
@@ -97,16 +99,16 @@ typedef enum {
 
 typedef enum {
 	TCAL_HEATED_STOP_NONE = 0,
-	TCAL_HEATED_STOP_COMPLETE,
-	TCAL_HEATED_STOP_USER,
-	TCAL_HEATED_STOP_TIMEOUT,
-	TCAL_HEATED_STOP_POWER_LOST,
-	TCAL_HEATED_STOP_IMU_POWER_OFF,
-	TCAL_HEATED_STOP_TEMP_STALE,
-	TCAL_HEATED_STOP_OVERTEMP,
-	TCAL_HEATED_STOP_RISE_FAST,
-	TCAL_HEATED_STOP_HEATER_ERROR,
-	TCAL_HEATED_STOP_START_FAILED,
+	TCAL_HEATED_STOP_COMPLETE = 1,
+	TCAL_HEATED_STOP_USER = 2,
+	TCAL_HEATED_STOP_TIMEOUT = 3,
+	TCAL_HEATED_STOP_POWER_LOST = 4,
+	TCAL_HEATED_STOP_IMU_POWER_OFF = 5,
+	TCAL_HEATED_STOP_TEMP_STALE = 6,
+	TCAL_HEATED_STOP_OVERTEMP = 7,
+	TCAL_HEATED_STOP_RISE_FAST = 8,
+	TCAL_HEATED_STOP_HEATER_ERROR = 9,
+	TCAL_HEATED_STOP_START_FAILED = 10,
 } tcal_heated_stop_reason_t;
 
 typedef struct {
@@ -150,11 +152,60 @@ static struct {
 static bool tcal_heated_tuning_initialized;
 static tcal_heated_staged_point_t tcal_heated_stage[TCAL_BUFFER_SIZE];
 
+/*
+ * All externally requested heater mutations pass through this single-slot
+ * mailbox and are executed by the sensor thread. A deadline prevents a stale
+ * START from running after its requester has already timed out.
+ */
+static struct {
+	struct k_spinlock lock;
+	bool occupied;
+	bool pending;
+	bool executing;
+	bool complete;
+	bool detached;
+	bool deferred;
+	uint32_t next_token;
+	uint32_t token;
+	sensor_tcal_heated_cmd_t command;
+	float value;
+	int64_t deadline_ms;
+	int result;
+	uint32_t deferred_token;
+	sensor_tcal_heated_cmd_t deferred_command;
+	float deferred_value;
+	int64_t deferred_deadline_ms;
+	bool deferred_detached;
+	/*
+	 * Safety upgrades may replace tokens that already have pollers.  Preserve
+	 * each accepted token until the replacement safety action finishes.
+	 */
+	uint32_t superseded_token[3];
+	bool superseded_complete[3];
+	int superseded_result[3];
+} tcal_heated_mailbox;
+
+/*
+ * A failed PWM zero write keeps the heated owner held and the driver safety
+ * latch engaged.  The sensor thread retries at the start of every cycle; no
+ * later control calculation can re-assert a non-zero duty in the meantime.
+ */
+static bool tcal_heated_force_off_retry_pending;
+static bool tcal_heated_clear_safety_interlock_after_force_off;
+
+static atomic_t tcal_heated_wire_status =
+	ATOMIC_INIT(IS_ENABLED(CONFIG_SK_REMOTE_HEATED_TCAL_TEST) ? BIT(0) : 0);
+
 static void tcal_heated_stage_reset(void);
 static void tcal_heated_stage_commit(void);
 static void tcal_heated_stage_point(int idx, const float bias[3], float measured_temp);
 static bool tcal_heated_collect_to_stage(void);
 static bool tcal_heated_should_accumulate(void);
+static int tcal_heated_start_internal(float target_temp);
+static int tcal_heated_user_stop_internal(bool commit_staged);
+static int tcal_heated_set_open_loop_duty_internal(uint16_t duty_pptt);
+static int tcal_heated_tune_internal(sensor_tcal_heated_cmd_t command, float value);
+static void tcal_heated_publish_status(void);
 #else
 static bool tcal_heated_should_accumulate(void) { return true; }
 #endif
@@ -274,7 +325,7 @@ void update_tcal_state(void)
 	sensor_fusion_update_bias(NULL);
 }
 
-void sensor_tcal_set_auto_calibration(bool enabled)
+static void tcal_set_auto_calibration_internal(bool enabled)
 {
 	tcal_auto_calibration_enabled = enabled;
 	/* Do not set SYS_STATUS_CALIBRATION_RUNNING — that flag means blocking cal
@@ -283,6 +334,18 @@ void sensor_tcal_set_auto_calibration(bool enabled)
 		tcal_accum_reset();
 	}
 	LOG_INF("T-Cal Auto-calibration %s", enabled ? "enabled" : "disabled");
+}
+
+int sensor_tcal_set_auto_calibration(bool enabled)
+{
+	int err = sensor_calibration_mutation_claim();
+	if (err) {
+		LOG_WRN("T-Cal auto-calibration change rejected while calibration data is owned");
+		return err;
+	}
+	tcal_set_auto_calibration_internal(enabled);
+	sensor_calibration_mutation_release();
+	return 0;
 }
 
 // Get auto-calibration enabled status
@@ -915,9 +978,58 @@ static void tcal_heated_stage_commit(void)
 	tcal_heated_stage_reset();
 }
 
+static uint8_t tcal_heated_wire_stop_reason(tcal_heated_stop_reason_t reason)
+{
+	switch (reason) {
+	case TCAL_HEATED_STOP_NONE:
+		return SK_ESB_HEATED_TCAL_STOP_NONE;
+	case TCAL_HEATED_STOP_COMPLETE:
+		return SK_ESB_HEATED_TCAL_STOP_COMPLETE;
+	case TCAL_HEATED_STOP_USER:
+		return SK_ESB_HEATED_TCAL_STOP_USER;
+	case TCAL_HEATED_STOP_TIMEOUT:
+		return SK_ESB_HEATED_TCAL_STOP_TIMEOUT;
+	case TCAL_HEATED_STOP_POWER_LOST:
+		return SK_ESB_HEATED_TCAL_STOP_POWER_LOST;
+	case TCAL_HEATED_STOP_IMU_POWER_OFF:
+		return SK_ESB_HEATED_TCAL_STOP_IMU_POWER_OFF;
+	case TCAL_HEATED_STOP_TEMP_STALE:
+		return SK_ESB_HEATED_TCAL_STOP_TEMP_STALE;
+	case TCAL_HEATED_STOP_OVERTEMP:
+		return SK_ESB_HEATED_TCAL_STOP_OVERTEMP;
+	case TCAL_HEATED_STOP_RISE_FAST:
+		return SK_ESB_HEATED_TCAL_STOP_RISE_FAST;
+	case TCAL_HEATED_STOP_HEATER_ERROR:
+		return SK_ESB_HEATED_TCAL_STOP_HEATER_ERROR;
+	case TCAL_HEATED_STOP_START_FAILED:
+		return SK_ESB_HEATED_TCAL_STOP_START_FAILED;
+	default:
+		return SK_ESB_HEATED_TCAL_STOP_START_FAILED;
+	}
+}
+
+static void tcal_heated_publish_status(void)
+{
+	uint8_t status = IS_ENABLED(CONFIG_SK_REMOTE_HEATED_TCAL_TEST) ? BIT(0) : 0;
+
+	if (tcal_heated.active) {
+		status |= BIT(1);
+	}
+	if (tcal_heated.active && tcal_heated.sampling_enabled) {
+		status |= BIT(2);
+	}
+	status |= (tcal_heated_wire_stop_reason(tcal_heated.stop_reason) & 0x1f) << 3;
+	atomic_set(&tcal_heated_wire_status, status);
+}
+
+uint8_t sensor_tcal_heated_status_snapshot(void)
+{
+	return (uint8_t)atomic_get(&tcal_heated_wire_status);
+}
+
 bool sensor_tcal_heated_is_active(void)
 {
-	return tcal_heated.active;
+	return (sensor_tcal_heated_status_snapshot() & BIT(1)) != 0;
 }
 
 static int tcal_heated_validate_start(float *current_temp)
@@ -939,29 +1051,37 @@ static int tcal_heated_validate_start(float *current_temp)
 	}
 
 	if (sensor_get_current_imu_temperature_checked(current_temp, 2000) != 0) {
-		return -ETIMEDOUT;
-	}
-
-	if (sensor_calibration_request(0) != 0) {
-		return -EBUSY;
+		return -EAGAIN;
 	}
 
 	return 0;
 }
 
-static void tcal_heated_stop_internal(tcal_heated_stop_reason_t reason, bool commit_staged)
+static int tcal_heated_stop_internal(tcal_heated_stop_reason_t reason, bool commit_staged)
 {
 	bool was_active = tcal_heated.active;
 	bool was_collecting = was_active && tcal_heated.state != TCAL_HEATED_STATE_OPEN_LOOP;
 	bool previous_auto = tcal_heated.previous_auto_enabled;
 
-	heater_force_off();
-	tcal_heated.duty_pptt = 0;
+	int off_err = heater_force_off_checked();
+	if (off_err == 0) {
+		tcal_heated.duty_pptt = 0;
+	} else {
+		LOG_ERR("Heated T-Cal failed to force heater off: %d", off_err);
+		tcal_heated_force_off_retry_pending = true;
+		tcal_heated_clear_safety_interlock_after_force_off |= was_active;
+		reason = TCAL_HEATED_STOP_HEATER_ERROR;
+	}
 
 	if (was_collecting) {
 		if (commit_staged) {
 			tcal_accum_flush();
 			tcal_heated_stage_commit();
+			/*
+			 * A short final window may be below the flush threshold.  Never
+			 * carry those samples into a later Heated T-Cal session.
+			 */
+			tcal_accum_reset();
 		} else {
 			tcal_accum_reset();
 			tcal_heated_stage_reset();
@@ -972,7 +1092,7 @@ static void tcal_heated_stop_internal(tcal_heated_stop_reason_t reason, bool com
 		if (!(reason == TCAL_HEATED_STOP_USER && !commit_staged)) {
 			tcal_heated_signal_stop_led(reason);
 		}
-		sensor_tcal_set_auto_calibration(previous_auto);
+		tcal_set_auto_calibration_internal(previous_auto);
 		set_status(SYS_STATUS_CALIBRATION_RUNNING, false);
 	}
 
@@ -982,15 +1102,29 @@ static void tcal_heated_stop_internal(tcal_heated_stop_reason_t reason, bool com
 	tcal_heated.stop_reason = reason;
 	tcal_heated.stable_start_time = 0;
 	tcal_heated.rest_start_time = 0;
+	if (was_active) {
+		if (off_err == 0) {
+			sensor_calibration_heated_release();
+		} else {
+			/*
+			 * All HEATED exit paths release their owner.  A failed zero write
+			 * atomically transfers exclusion to the separate hardware-safety
+			 * barrier until the sensor thread's checked retry succeeds.
+			 */
+			sensor_calibration_heated_release_faulted();
+		}
+	}
+	tcal_heated_publish_status();
 
 	LOG_INF(
 		"Heated T-Cal stopped: %s, staged data %s",
 		tcal_heated_stop_reason_name(reason),
 		commit_staged ? "committed" : "discarded"
 	);
+	return off_err == 0 ? 0 : -EIO;
 }
 
-int sensor_tcal_heated_start(float target_temp)
+static int tcal_heated_start_internal(float target_temp)
 {
 	tcal_heated_init_tuning();
 
@@ -1007,22 +1141,45 @@ int sensor_tcal_heated_start(float target_temp)
 	    target_temp > (float)CONFIG_SENSOR_TCAL_HEATED_MAX_TEMP_C) {
 		tcal_heated.stop_reason = TCAL_HEATED_STOP_START_FAILED;
 		tcal_heated_signal_stop_led(TCAL_HEATED_STOP_START_FAILED);
+		tcal_heated_publish_status();
 		return -ERANGE;
 	}
 
+	int err = sensor_calibration_heated_claim();
+	if (err) {
+		return err;
+	}
+
 	float current_temp = NAN;
-	int err = tcal_heated_validate_start(&current_temp);
+	err = tcal_heated_validate_start(&current_temp);
 	if (err) {
 		tcal_heated.stop_reason = TCAL_HEATED_STOP_START_FAILED;
 		tcal_heated_signal_stop_led(TCAL_HEATED_STOP_START_FAILED);
+		sensor_calibration_heated_release();
+		tcal_heated_publish_status();
 		return err;
+	}
+
+	err = heater_prepare_control();
+	if (err) {
+		tcal_heated.stop_reason = TCAL_HEATED_STOP_HEATER_ERROR;
+		tcal_heated_signal_stop_led(TCAL_HEATED_STOP_HEATER_ERROR);
+		if (err == -EBUSY) {
+			sensor_calibration_heated_release();
+		} else {
+			tcal_heated_force_off_retry_pending = true;
+			tcal_heated_clear_safety_interlock_after_force_off = true;
+			sensor_calibration_heated_release_faulted();
+		}
+		tcal_heated_publish_status();
+		return err == -EBUSY ? -EAGAIN : -EIO;
 	}
 
 	tcal_heated_stage_reset();
 	tcal_accum_reset();
 
 	tcal_heated.previous_auto_enabled = sensor_tcal_get_auto_calibration();
-	sensor_tcal_set_auto_calibration(true);
+	tcal_set_auto_calibration_internal(true);
 	set_status(SYS_STATUS_CALIBRATION_RUNNING, true);
 
 	int64_t now = k_uptime_get();
@@ -1045,6 +1202,7 @@ int sensor_tcal_heated_start(float target_temp)
 	tcal_heated.stable_start_time = 0;
 	tcal_heated.rest_start_time = now;
 	tcal_heated.led_cache_valid = false;
+	tcal_heated_publish_status();
 
 	LOG_INF(
 		"Heated T-Cal started: current %.2fC, target %.2fC, Kp %.2f, Ki %.2f, Kff %.2f",
@@ -1058,17 +1216,23 @@ int sensor_tcal_heated_start(float target_temp)
 	return 0;
 }
 
-void sensor_tcal_heated_stop(void)
+static int tcal_heated_user_stop_internal(bool commit_staged)
 {
-	tcal_heated_stop_internal(TCAL_HEATED_STOP_USER, true);
+	if (!tcal_heated.active) {
+		/*
+		 * The sensor-cycle retry runs before mailbox commands.  If it still
+		 * could not prove zero PWM, an inactive ABORT is not yet a safe
+		 * completion for pairing/legacy preemption.
+		 */
+		if (tcal_heated_force_off_retry_pending) {
+			return -EIO;
+		}
+		return -EALREADY;
+	}
+	return tcal_heated_stop_internal(TCAL_HEATED_STOP_USER, commit_staged);
 }
 
-void sensor_tcal_heated_abort(void)
-{
-	tcal_heated_stop_internal(TCAL_HEATED_STOP_USER, false);
-}
-
-int sensor_tcal_heated_set_open_loop_duty(uint16_t duty_pptt)
+static int tcal_heated_set_open_loop_duty_internal(uint16_t duty_pptt)
 {
 	tcal_heated_init_tuning();
 
@@ -1076,19 +1240,63 @@ int sensor_tcal_heated_set_open_loop_duty(uint16_t duty_pptt)
 		return -EBUSY;
 	}
 
+	bool newly_claimed = false;
+	if (!tcal_heated.active) {
+		int claim_err = sensor_calibration_heated_claim();
+		if (claim_err) {
+			return claim_err;
+		}
+		newly_claimed = true;
+	}
+
 	float current_temp = NAN;
 	int err = tcal_heated_validate_start(&current_temp);
 	if (err) {
 		tcal_heated.stop_reason = TCAL_HEATED_STOP_START_FAILED;
 		tcal_heated_signal_stop_led(TCAL_HEATED_STOP_START_FAILED);
+		if (newly_claimed) {
+			sensor_calibration_heated_release();
+		}
+		tcal_heated_publish_status();
 		return err;
+	}
+
+	if (newly_claimed) {
+		err = heater_prepare_control();
+		if (err) {
+			tcal_heated.stop_reason = TCAL_HEATED_STOP_HEATER_ERROR;
+			tcal_heated_signal_stop_led(TCAL_HEATED_STOP_HEATER_ERROR);
+			if (err == -EBUSY) {
+				sensor_calibration_heated_release();
+			} else {
+				tcal_heated_force_off_retry_pending = true;
+				tcal_heated_clear_safety_interlock_after_force_off = true;
+				sensor_calibration_heated_release_faulted();
+			}
+			tcal_heated_publish_status();
+			return err == -EBUSY ? -EAGAIN : -EIO;
+		}
 	}
 
 	err = heater_set_duty_pptt(duty_pptt);
 	if (err) {
-		tcal_heated.stop_reason = TCAL_HEATED_STOP_HEATER_ERROR;
-		tcal_heated_signal_stop_led(TCAL_HEATED_STOP_HEATER_ERROR);
-		return err;
+		if (newly_claimed) {
+			int off_err = heater_force_off_checked();
+			tcal_heated.stop_reason = TCAL_HEATED_STOP_HEATER_ERROR;
+			tcal_heated_signal_stop_led(TCAL_HEATED_STOP_HEATER_ERROR);
+			if (off_err == 0) {
+				sensor_calibration_heated_release();
+			} else {
+				tcal_heated_force_off_retry_pending = true;
+				tcal_heated_clear_safety_interlock_after_force_off = true;
+				sensor_calibration_heated_release_faulted();
+			}
+			tcal_heated_publish_status();
+		} else {
+			(void)tcal_heated_stop_internal(
+				TCAL_HEATED_STOP_HEATER_ERROR, false);
+		}
+		return -EIO;
 	}
 
 	int64_t now = k_uptime_get();
@@ -1110,22 +1318,27 @@ int sensor_tcal_heated_set_open_loop_duty(uint16_t duty_pptt)
 	tcal_heated.duty_pptt = MIN(duty_pptt, CONFIG_SYSTEM_IMU_HEATER_MAX_DUTY_PPTT);
 	tcal_heated.led_cache_valid = false;
 	tcal_heated_update_led(current_temp);
+	tcal_heated_publish_status();
 	return 0;
 }
 
-int sensor_tcal_heated_tune(const char *param, float value)
+static int tcal_heated_tune_internal(sensor_tcal_heated_cmd_t command, float value)
 {
 	tcal_heated_init_tuning();
 
-	if (!param || isnan(value) || value < 0.0f) {
+	if (isnan(value) || value < 0.0f) {
 		return -EINVAL;
 	}
 
-	if (strcmp(param, "kp") == 0) {
+	const char *param;
+	if (command == SENSOR_TCAL_HEATED_CMD_TUNE_KP) {
+		param = "kp";
 		tcal_heated.kp = value;
-	} else if (strcmp(param, "ki") == 0) {
+	} else if (command == SENSOR_TCAL_HEATED_CMD_TUNE_KI) {
+		param = "ki";
 		tcal_heated.ki = value;
-	} else if (strcmp(param, "kff") == 0) {
+	} else if (command == SENSOR_TCAL_HEATED_CMD_TUNE_KFF) {
+		param = "kff";
 		tcal_heated.kff = value;
 	} else {
 		return -EINVAL;
@@ -1133,6 +1346,472 @@ int sensor_tcal_heated_tune(const char *param, float value)
 
 	LOG_INF("Heated T-Cal tune: %s = %.4f", param, (double)value);
 	return 0;
+}
+
+static bool tcal_heated_command_is_safety(sensor_tcal_heated_cmd_t command)
+{
+	return command == SENSOR_TCAL_HEATED_CMD_STOP ||
+	       command == SENSOR_TCAL_HEATED_CMD_ABORT;
+}
+
+static bool tcal_heated_command_is_ordinary(sensor_tcal_heated_cmd_t command)
+{
+	return !tcal_heated_command_is_safety(command);
+}
+
+static uint32_t tcal_heated_next_token_locked(void)
+{
+	tcal_heated_mailbox.next_token++;
+	if (tcal_heated_mailbox.next_token == 0) {
+		tcal_heated_mailbox.next_token++;
+	}
+	return tcal_heated_mailbox.next_token;
+}
+
+static bool tcal_heated_superseded_add_locked(uint32_t token)
+{
+	if (token == 0) {
+		return true;
+	}
+
+	int free_slot = -1;
+	for (int i = 0; i < ARRAY_SIZE(tcal_heated_mailbox.superseded_token); i++) {
+		if (tcal_heated_mailbox.superseded_token[i] == token) {
+			return true;
+		}
+		if (tcal_heated_mailbox.superseded_token[i] == 0 && free_slot < 0) {
+			free_slot = i;
+		}
+	}
+	if (free_slot < 0) {
+		return false;
+	}
+	tcal_heated_mailbox.superseded_token[free_slot] = token;
+	tcal_heated_mailbox.superseded_complete[free_slot] = false;
+	return true;
+}
+
+static void tcal_heated_superseded_remove_locked(uint32_t token)
+{
+	for (int i = 0; i < ARRAY_SIZE(tcal_heated_mailbox.superseded_token); i++) {
+		if (tcal_heated_mailbox.superseded_token[i] == token) {
+			tcal_heated_mailbox.superseded_token[i] = 0;
+			tcal_heated_mailbox.superseded_complete[i] = false;
+			return;
+		}
+	}
+}
+
+static void tcal_heated_superseded_complete_locked(int result)
+{
+	for (int i = 0; i < ARRAY_SIZE(tcal_heated_mailbox.superseded_token); i++) {
+		if (tcal_heated_mailbox.superseded_token[i] != 0 &&
+		    !tcal_heated_mailbox.superseded_complete[i]) {
+			tcal_heated_mailbox.superseded_result[i] =
+				result == 0 ? -ECANCELED : result;
+			tcal_heated_mailbox.superseded_complete[i] = true;
+		}
+	}
+}
+
+static int tcal_heated_submit_internal(sensor_tcal_heated_cmd_t command, float value,
+				       int64_t deadline_ms, bool detached,
+				       uint32_t *token)
+{
+	if ((!detached && token == NULL) ||
+	    command < SENSOR_TCAL_HEATED_CMD_START ||
+	    command > SENSOR_TCAL_HEATED_CMD_TUNE_KFF) {
+		return -EINVAL;
+	}
+
+	int64_t now = k_uptime_get();
+	k_spinlock_key_t key = k_spin_lock(&tcal_heated_mailbox.lock);
+	bool stale_completed = tcal_heated_mailbox.occupied &&
+		tcal_heated_mailbox.complete &&
+		tcal_heated_mailbox.deadline_ms > 0 &&
+		now > tcal_heated_mailbox.deadline_ms + 1000;
+	bool expired_pending = tcal_heated_mailbox.occupied &&
+		!tcal_heated_mailbox.executing &&
+		!tcal_heated_mailbox.complete &&
+		tcal_heated_mailbox.command == SENSOR_TCAL_HEATED_CMD_START &&
+		tcal_heated_mailbox.deadline_ms > 0 &&
+		now >= tcal_heated_mailbox.deadline_ms;
+
+	if (tcal_heated_mailbox.occupied &&
+	    tcal_heated_command_is_safety(command)) {
+		if (tcal_heated_mailbox.executing) {
+			bool executing_ordinary =
+				tcal_heated_command_is_ordinary(tcal_heated_mailbox.command);
+			bool abort_after_stop =
+				tcal_heated_mailbox.command == SENSOR_TCAL_HEATED_CMD_STOP &&
+				command == SENSOR_TCAL_HEATED_CMD_ABORT;
+			if (!executing_ordinary && !abort_after_stop) {
+				k_spin_unlock(&tcal_heated_mailbox.lock, key);
+				return -EBUSY;
+			}
+			if (tcal_heated_mailbox.deferred) {
+				bool upgrade_stop_to_abort =
+					tcal_heated_mailbox.deferred_command ==
+						SENSOR_TCAL_HEATED_CMD_STOP &&
+					command == SENSOR_TCAL_HEATED_CMD_ABORT;
+				if (!upgrade_stop_to_abort) {
+					k_spin_unlock(&tcal_heated_mailbox.lock, key);
+					return -EBUSY;
+				}
+				if (!tcal_heated_mailbox.deferred_detached) {
+					if (!tcal_heated_superseded_add_locked(
+						    tcal_heated_mailbox.deferred_token)) {
+						k_spin_unlock(&tcal_heated_mailbox.lock, key);
+						return -EBUSY;
+					}
+				}
+			} else if (!tcal_heated_mailbox.detached) {
+				/*
+				 * Reserve the executing request's alias before accepting a
+				 * deferred safety action.  The sensor-cycle handoff below then
+				 * cannot discover an exhausted alias table after submission.
+				 */
+				if (!tcal_heated_superseded_add_locked(
+					    tcal_heated_mailbox.token)) {
+					k_spin_unlock(&tcal_heated_mailbox.lock, key);
+					return -EBUSY;
+				}
+			}
+
+			uint32_t next_token = tcal_heated_next_token_locked();
+			tcal_heated_mailbox.deferred = true;
+			tcal_heated_mailbox.deferred_token = next_token;
+			tcal_heated_mailbox.deferred_command = command;
+			tcal_heated_mailbox.deferred_value = value;
+			tcal_heated_mailbox.deferred_deadline_ms = deadline_ms;
+			tcal_heated_mailbox.deferred_detached = detached;
+			if (token != NULL) {
+				*token = next_token;
+			}
+			k_spin_unlock(&tcal_heated_mailbox.lock, key);
+			return 0;
+		}
+
+		if (tcal_heated_mailbox.pending) {
+			bool abort_already_pending =
+				tcal_heated_mailbox.command == SENSOR_TCAL_HEATED_CMD_ABORT;
+			bool duplicate_stop =
+				tcal_heated_mailbox.command == SENSOR_TCAL_HEATED_CMD_STOP &&
+				command == SENSOR_TCAL_HEATED_CMD_STOP;
+			if (abort_already_pending || duplicate_stop) {
+				k_spin_unlock(&tcal_heated_mailbox.lock, key);
+				return -EBUSY;
+			}
+			if (!tcal_heated_mailbox.detached) {
+				if (!tcal_heated_superseded_add_locked(
+					    tcal_heated_mailbox.token)) {
+					k_spin_unlock(&tcal_heated_mailbox.lock, key);
+					return -EBUSY;
+				}
+			}
+			/*
+			 * Any safety command preempts pending START/DUTY/TUNE.  ABORT also
+			 * upgrades a pending STOP so staged data cannot be committed.
+			 */
+			} else if (tcal_heated_mailbox.complete) {
+				if (!tcal_heated_mailbox.detached) {
+					if (!tcal_heated_superseded_add_locked(
+						    tcal_heated_mailbox.token)) {
+						k_spin_unlock(&tcal_heated_mailbox.lock, key);
+						return -EBUSY;
+					}
+				}
+			} else {
+				k_spin_unlock(&tcal_heated_mailbox.lock, key);
+				return -EBUSY;
+			}
+	} else if (tcal_heated_mailbox.occupied &&
+		   !stale_completed && !expired_pending) {
+		k_spin_unlock(&tcal_heated_mailbox.lock, key);
+		return -EBUSY;
+	}
+
+	uint32_t next_token = tcal_heated_next_token_locked();
+	tcal_heated_mailbox.token = next_token;
+	tcal_heated_mailbox.command = command;
+	tcal_heated_mailbox.value = value;
+	tcal_heated_mailbox.deadline_ms = deadline_ms;
+	tcal_heated_mailbox.result = -EINPROGRESS;
+	tcal_heated_mailbox.occupied = true;
+	tcal_heated_mailbox.pending = true;
+	tcal_heated_mailbox.executing = false;
+	tcal_heated_mailbox.complete = false;
+	tcal_heated_mailbox.detached = detached;
+	tcal_heated_mailbox.deferred = false;
+	if (token != NULL) {
+		*token = next_token;
+	}
+	k_spin_unlock(&tcal_heated_mailbox.lock, key);
+	return 0;
+}
+
+int sensor_tcal_heated_submit(sensor_tcal_heated_cmd_t command, float value,
+			      int64_t deadline_ms, uint32_t *token)
+{
+	return tcal_heated_submit_internal(
+		command, value, deadline_ms, false, token);
+}
+
+int sensor_tcal_heated_submit_detached(sensor_tcal_heated_cmd_t command, float value,
+				       int64_t deadline_ms)
+{
+	return tcal_heated_submit_internal(
+		command, value, deadline_ms, true, NULL);
+}
+
+int sensor_tcal_heated_poll(uint32_t token, int *result)
+{
+	if (token == 0 || result == NULL) {
+		return -EINVAL;
+	}
+
+	k_spinlock_key_t key = k_spin_lock(&tcal_heated_mailbox.lock);
+	for (int i = 0; i < ARRAY_SIZE(tcal_heated_mailbox.superseded_token); i++) {
+		if (tcal_heated_mailbox.superseded_token[i] != token) {
+			continue;
+		}
+		if (!tcal_heated_mailbox.superseded_complete[i]) {
+			k_spin_unlock(&tcal_heated_mailbox.lock, key);
+			return 0;
+		}
+		*result = tcal_heated_mailbox.superseded_result[i];
+		tcal_heated_mailbox.superseded_token[i] = 0;
+		tcal_heated_mailbox.superseded_complete[i] = false;
+		k_spin_unlock(&tcal_heated_mailbox.lock, key);
+		return 1;
+	}
+	if (!tcal_heated_mailbox.occupied || tcal_heated_mailbox.token != token) {
+		if (tcal_heated_mailbox.occupied && tcal_heated_mailbox.deferred &&
+		    tcal_heated_mailbox.deferred_token == token) {
+			k_spin_unlock(&tcal_heated_mailbox.lock, key);
+			return 0;
+		}
+		k_spin_unlock(&tcal_heated_mailbox.lock, key);
+		return -ENOENT;
+	}
+	if (!tcal_heated_mailbox.complete) {
+		k_spin_unlock(&tcal_heated_mailbox.lock, key);
+		return 0;
+	}
+
+	*result = tcal_heated_mailbox.result;
+	tcal_heated_mailbox.occupied = false;
+	tcal_heated_mailbox.complete = false;
+	k_spin_unlock(&tcal_heated_mailbox.lock, key);
+	return 1;
+}
+
+void sensor_tcal_heated_abandon(uint32_t token)
+{
+	if (token == 0) {
+		return;
+	}
+
+	k_spinlock_key_t key = k_spin_lock(&tcal_heated_mailbox.lock);
+	if (tcal_heated_mailbox.occupied &&
+	    tcal_heated_mailbox.token == token) {
+		if (tcal_heated_mailbox.complete) {
+			tcal_heated_mailbox.occupied = false;
+			tcal_heated_mailbox.complete = false;
+		} else {
+			tcal_heated_mailbox.detached = true;
+		}
+		/*
+		 * An executing request may also have an alias reserved for a
+		 * deferred safety handoff.  Its abandoning poller releases that
+			 * reservation immediately.
+			 */
+	} else if (tcal_heated_mailbox.occupied &&
+		   tcal_heated_mailbox.deferred &&
+		   tcal_heated_mailbox.deferred_token == token) {
+		tcal_heated_mailbox.deferred_detached = true;
+	}
+	/*
+	 * A token can simultaneously name the main/deferred request and occupy a
+	 * superseded alias slot during a safety upgrade.  Detaching its poller
+	 * must release both identities or three interrupted handoffs exhaust the
+	 * fixed alias table permanently.
+	 */
+	tcal_heated_superseded_remove_locked(token);
+	k_spin_unlock(&tcal_heated_mailbox.lock, key);
+}
+
+void sensor_tcal_heated_process_mailbox(void)
+{
+	struct {
+		uint32_t token;
+		sensor_tcal_heated_cmd_t command;
+		float value;
+		int64_t deadline_ms;
+	} request;
+
+	if (tcal_heated_force_off_retry_pending) {
+		int retry_err = heater_force_off_checked();
+		if (retry_err == 0) {
+			tcal_heated_force_off_retry_pending = false;
+			tcal_heated.duty_pptt = 0;
+			if (tcal_heated_clear_safety_interlock_after_force_off) {
+				tcal_heated_clear_safety_interlock_after_force_off = false;
+				sensor_calibration_heated_safety_clear();
+			}
+			tcal_heated_publish_status();
+			LOG_INF("Heated T-Cal safety retry forced heater off");
+		} else {
+			LOG_ERR("Heated T-Cal safety retry failed: %d", retry_err);
+		}
+	}
+
+	k_spinlock_key_t key = k_spin_lock(&tcal_heated_mailbox.lock);
+	if (!tcal_heated_mailbox.occupied || !tcal_heated_mailbox.pending) {
+		k_spin_unlock(&tcal_heated_mailbox.lock, key);
+		return;
+	}
+	request.token = tcal_heated_mailbox.token;
+	request.command = tcal_heated_mailbox.command;
+	request.value = tcal_heated_mailbox.value;
+	request.deadline_ms = tcal_heated_mailbox.deadline_ms;
+	tcal_heated_mailbox.pending = false;
+	tcal_heated_mailbox.executing = true;
+	k_spin_unlock(&tcal_heated_mailbox.lock, key);
+
+	int result;
+	if (request.command == SENSOR_TCAL_HEATED_CMD_START &&
+	    request.deadline_ms > 0 && k_uptime_get() >= request.deadline_ms) {
+		result = -ETIMEDOUT;
+	} else {
+		switch (request.command) {
+		case SENSOR_TCAL_HEATED_CMD_START:
+			result = tcal_heated_start_internal(request.value);
+			break;
+		case SENSOR_TCAL_HEATED_CMD_STOP:
+			result = tcal_heated_user_stop_internal(true);
+			break;
+		case SENSOR_TCAL_HEATED_CMD_ABORT:
+			result = tcal_heated_user_stop_internal(false);
+			break;
+		case SENSOR_TCAL_HEATED_CMD_DUTY:
+			if (request.value < 0.0f || request.value > 10000.0f) {
+				result = -ERANGE;
+			} else {
+				result = tcal_heated_set_open_loop_duty_internal((uint16_t)request.value);
+			}
+			break;
+		case SENSOR_TCAL_HEATED_CMD_TUNE_KP:
+		case SENSOR_TCAL_HEATED_CMD_TUNE_KI:
+		case SENSOR_TCAL_HEATED_CMD_TUNE_KFF:
+			result = tcal_heated_tune_internal(request.command, request.value);
+			break;
+		default:
+			result = -EINVAL;
+			break;
+		}
+	}
+
+	key = k_spin_lock(&tcal_heated_mailbox.lock);
+	if (tcal_heated_mailbox.occupied && tcal_heated_mailbox.token == request.token) {
+		if (tcal_heated_mailbox.deferred) {
+			/*
+			 * START crossed the execution boundary before STOP/ABORT arrived.
+			 * Do not expose its intermediate result; execute the safety action
+			 * at the beginning of the very next sensor cycle.  Its poll token
+			 * was reserved as an alias before the deferred action was accepted.
+			 */
+			tcal_heated_mailbox.token = tcal_heated_mailbox.deferred_token;
+			tcal_heated_mailbox.command = tcal_heated_mailbox.deferred_command;
+			tcal_heated_mailbox.value = tcal_heated_mailbox.deferred_value;
+			tcal_heated_mailbox.deadline_ms = tcal_heated_mailbox.deferred_deadline_ms;
+			tcal_heated_mailbox.result = -EINPROGRESS;
+			tcal_heated_mailbox.pending = true;
+			tcal_heated_mailbox.executing = false;
+			tcal_heated_mailbox.complete = false;
+			tcal_heated_mailbox.detached =
+				tcal_heated_mailbox.deferred_detached;
+			tcal_heated_mailbox.deferred = false;
+		} else if (tcal_heated_mailbox.detached) {
+			/*
+			 * Pairing/reset paths deliberately have no poller.  Consume their
+			 * completion here so one fire-and-forget ABORT cannot permanently
+			 * occupy the mailbox.
+			 */
+			tcal_heated_superseded_complete_locked(result);
+			tcal_heated_mailbox.occupied = false;
+			tcal_heated_mailbox.executing = false;
+			tcal_heated_mailbox.complete = false;
+		} else {
+			tcal_heated_superseded_complete_locked(result);
+			tcal_heated_mailbox.result = result;
+			tcal_heated_mailbox.executing = false;
+			tcal_heated_mailbox.complete = true;
+		}
+	}
+	k_spin_unlock(&tcal_heated_mailbox.lock, key);
+}
+
+static int tcal_heated_submit_and_wait(sensor_tcal_heated_cmd_t command, float value)
+{
+	int64_t deadline = k_uptime_get() + 2000;
+	uint32_t token;
+	int err = sensor_tcal_heated_submit(command, value, deadline, &token);
+	if (err) {
+		return err;
+	}
+
+	while (k_uptime_get() <= deadline) {
+		int result;
+		int state = sensor_tcal_heated_poll(token, &result);
+		if (state == 1) {
+			return result;
+		}
+		if (state < 0) {
+			return state;
+		}
+		k_msleep(1);
+	}
+	sensor_tcal_heated_abandon(token);
+	return -ETIMEDOUT;
+}
+
+int sensor_tcal_heated_start(float target_temp)
+{
+	return tcal_heated_submit_and_wait(SENSOR_TCAL_HEATED_CMD_START, target_temp);
+}
+
+int sensor_tcal_heated_stop(void)
+{
+	return tcal_heated_submit_and_wait(SENSOR_TCAL_HEATED_CMD_STOP, 0.0f);
+}
+
+int sensor_tcal_heated_abort(void)
+{
+	return tcal_heated_submit_and_wait(SENSOR_TCAL_HEATED_CMD_ABORT, 0.0f);
+}
+
+int sensor_tcal_heated_set_open_loop_duty(uint16_t duty_pptt)
+{
+	return tcal_heated_submit_and_wait(SENSOR_TCAL_HEATED_CMD_DUTY, (float)duty_pptt);
+}
+
+int sensor_tcal_heated_tune(const char *param, float value)
+{
+	sensor_tcal_heated_cmd_t command;
+
+	if (param == NULL) {
+		return -EINVAL;
+	} else if (strcmp(param, "kp") == 0) {
+		command = SENSOR_TCAL_HEATED_CMD_TUNE_KP;
+	} else if (strcmp(param, "ki") == 0) {
+		command = SENSOR_TCAL_HEATED_CMD_TUNE_KI;
+	} else if (strcmp(param, "kff") == 0) {
+		command = SENSOR_TCAL_HEATED_CMD_TUNE_KFF;
+	} else {
+		return -EINVAL;
+	}
+	return tcal_heated_submit_and_wait(command, value);
 }
 
 static int tcal_heated_apply_duty(float duty_raw, float dt_s)
@@ -1227,6 +1906,7 @@ void sensor_tcal_heated_update(bool is_resting)
 			tcal_heated.sampling_enabled = true;
 			tcal_heated.rest_start_time = now;
 		}
+		tcal_heated_publish_status();
 	}
 
 	tcal_heated_update_led(current_temp);
@@ -1307,6 +1987,7 @@ void sensor_tcal_heated_update(bool is_resting)
 	tcal_heated.last_ff_out = ff_out;
 	tcal_heated.last_temp = current_temp;
 	tcal_heated.last_control_time = now;
+	tcal_heated_publish_status();
 
 #if CONFIG_SENSOR_TCAL_HEATED_DEBUG_LOG
 	printk(
