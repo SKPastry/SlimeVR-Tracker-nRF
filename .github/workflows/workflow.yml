@@ -8,6 +8,7 @@ on:
       - main
       - dev
       - dev-*
+      - "feat/**"
     tags:
       - "*"
   create:

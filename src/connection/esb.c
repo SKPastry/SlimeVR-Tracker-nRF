@@ -41,6 +41,7 @@
 #include <zephyr/sys/atomic.h>
 #include <zephyr/kernel.h>
 
+#include <math.h>
 #include <stdlib.h>
 #include "esb.h"
 #include "tdma.h"
@@ -222,6 +223,20 @@ static void esb_remote_cmd_tcal_off(void)
 #if CONFIG_SENSOR_USE_TCAL
 	LOG_INF("Executing remote command: TCAL_OFF");
 	sensor_tcal_set_enabled(false);
+#endif
+}
+
+static void esb_remote_cmd_tcal_heat_start(void)
+{
+#if CONFIG_SENSOR_TCAL_HEATED
+	int err = sensor_tcal_heated_start(NAN);
+	if (err) {
+		LOG_WRN("Remote heated T-Cal start failed (err=%d)", err);
+	} else {
+		LOG_INF("Heated T-Cal started by remote command");
+	}
+#else
+	LOG_WRN("Remote command: TCAL_HEAT_START not supported (heated T-Cal disabled)");
 #endif
 }
 
@@ -504,6 +519,7 @@ static const struct esb_remote_cmd esb_remote_cmds[] = {
 	{ESB_PONG_FLAG_TCAL_BOOT_OFF, "TCAL_BOOT_OFF", esb_remote_cmd_tcal_boot_off},
 	{ESB_PONG_FLAG_TCAL_ON, "TCAL_ON", esb_remote_cmd_tcal_on},
 	{ESB_PONG_FLAG_TCAL_OFF, "TCAL_OFF", esb_remote_cmd_tcal_off},
+	{ESB_PONG_FLAG_TCAL_HEAT_START, "TCAL_HEAT_START", esb_remote_cmd_tcal_heat_start},
 	{ESB_PONG_FLAG_TDMA_ON, "TDMA_ON", esb_remote_cmd_tdma_on},
 	{ESB_PONG_FLAG_TDMA_OFF, "TDMA_OFF", esb_remote_cmd_tdma_off},
 	{ESB_PONG_FLAG_TEST_MODE_ON, "TEST_MODE_ON", esb_remote_cmd_test_mode_on},
