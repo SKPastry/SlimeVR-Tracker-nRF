@@ -2,6 +2,12 @@
 #include "system/system.h"
 #include "system/battery_tracker.h"
 #include "system/test_mode.h"
+#if defined(CONFIG_BOARD_SK_CHEESECAKE_NRF_P00) && defined(CONFIG_CRAZT_WS2812_STRIP_I2S)
+#include "system/ws2812_stress.h"
+#define CONSOLE_WS2812_STRESS_EXISTS 1
+#else
+#define CONSOLE_WS2812_STRESS_EXISTS 0
+#endif
 #include "sensor/sensor.h"
 #include "sensor/calibration/calibration.h"
 #if CONFIG_VQF_BENCH
@@ -724,6 +730,9 @@ static void print_help(void)
 #endif
 #if CONFIG_SENSOR_USE_TCAL
 	printk("  reset tcal                 Reset temperature calibration\n");
+#endif
+#if CONSOLE_WS2812_STRESS_EXISTS
+	printk("  ws2812 stress <start [frames]|stop|status>  Run I2S race stress test\n");
 #endif
 	printk("  reset mag                  Reset magnetometer calibration\n");
 	printk("  reset bat                  Reset battery tracker\n");
@@ -1656,6 +1665,108 @@ static void console_cmd_test(size_t argc, char **argv)
 	}
 }
 
+#if CONSOLE_WS2812_STRESS_EXISTS
+static const char *ws2812_stress_state_name(enum ws2812_stress_state state)
+{
+	switch (state) {
+	case WS2812_STRESS_IDLE:
+		return "idle";
+	case WS2812_STRESS_STARTING:
+		return "starting";
+	case WS2812_STRESS_RUNNING:
+		return "running";
+	case WS2812_STRESS_STOPPING:
+		return "stopping";
+	default:
+		return "unknown";
+	}
+}
+
+static void print_ws2812_stress_usage(void)
+{
+	printk("Usage: ws2812 stress <start [frames] | stop | status>\n");
+}
+
+static void print_ws2812_stress_status(void)
+{
+	struct ws2812_stress_status status;
+
+	ws2812_stress_get_status(&status);
+	printk(
+		"WS2812 stress: state=%s frames=%u/%u api_ok=%u api_failed=%u last_error=%d "
+		"elapsed_ms=%u wake_us=%u\n",
+		ws2812_stress_state_name(status.state),
+		(unsigned int)status.attempted_frames,
+		(unsigned int)status.target_frames,
+		(unsigned int)status.successful_frames,
+		(unsigned int)status.failed_frames,
+		status.last_error,
+		(unsigned int)status.elapsed_ms,
+		WS2812_STRESS_WAKE_PERIOD_US
+	);
+}
+
+static void console_cmd_ws2812(size_t argc, char **argv)
+{
+	if (argc < 3 || strcmp(argv[1], "stress") != 0) {
+		print_ws2812_stress_usage();
+		return;
+	}
+
+	if (strcmp(argv[2], "start") == 0) {
+		uint32_t frames = WS2812_STRESS_DEFAULT_FRAMES;
+
+		if (argc > 4) {
+			print_ws2812_stress_usage();
+			return;
+		}
+		if (argc == 4) {
+			char *endptr;
+			unsigned long parsed = strtoul(argv[3], &endptr, 10);
+
+			if (endptr == argv[3] || *endptr != '\0' || parsed == 0 ||
+			    parsed > WS2812_STRESS_MAX_FRAMES) {
+				printk(
+					"Invalid frame count (1-%u).\n",
+					WS2812_STRESS_MAX_FRAMES
+				);
+				return;
+			}
+			frames = (uint32_t)parsed;
+		}
+
+		int ret = ws2812_stress_start(frames);
+
+		if (ret == 0) {
+			printk(
+				"WS2812 stress started: target=%u wake_us=%u; "
+				"unfixed firmware may flood I2S errors.\n",
+				(unsigned int)frames,
+				WS2812_STRESS_WAKE_PERIOD_US
+			);
+		} else if (ret == -EBUSY) {
+			printk("WS2812 stress is already active.\n");
+		} else {
+			printk("Unable to start WS2812 stress: %d\n", ret);
+		}
+	} else if (strcmp(argv[2], "stop") == 0 && argc == 3) {
+		int ret = ws2812_stress_stop();
+
+		if (ret == 0) {
+			printk("WS2812 stress stop requested.\n");
+		} else if (ret == -EALREADY) {
+			printk("WS2812 stress is not active.\n");
+		} else {
+			printk("WS2812 stress is already stopping.\n");
+		}
+	} else if (strcmp(argv[2], "status") == 0 && argc == 3) {
+		print_ws2812_stress_status();
+	} else {
+		print_ws2812_stress_usage();
+	}
+}
+#endif
+
 static const struct console_cmd console_cmds[] = {
 	{"help", console_cmd_help},
 	{"info", console_cmd_info},
@@ -1695,6 +1806,9 @@ static const struct console_cmd console_cmds[] = {
 	{"reset", console_cmd_reset},
 	{"tdma", console_cmd_tdma},
 	{"test", console_cmd_test},
+#if CONSOLE_WS2812_STRESS_EXISTS
+	{"ws2812", console_cmd_ws2812},
+#endif
 };
 
 static void console_thread(void)
