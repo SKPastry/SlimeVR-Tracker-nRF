@@ -28,11 +28,6 @@
 #include "power_battery.h"
 #include "clock_control.h"
 
-#define DFU_DBL_RESET_MEM 0x20007F7C
-#define DFU_DBL_RESET_APP 0x4ee5677e
-
-static uint32_t *dbl_reset_mem __attribute__((unused)) = ((uint32_t *)DFU_DBL_RESET_MEM); // retained
-
 enum sys_regulator {
 	SYS_REGULATOR_DCDC,
 	SYS_REGULATOR_LDO
@@ -377,7 +372,6 @@ static bool sys_WOM(bool force) // TODO: if IMU interrupt does not exist what do
 	wait_for_logging();
 #if ADAFRUIT_BOOTLOADER // if using Adafruit bootloader, always skip dfu for next boot
 	NRF_POWER->GPREGRET = ADAFRUIT_DFU_MAGIC_SKIP;
-	(*dbl_reset_mem) = DFU_DBL_RESET_APP; // Skip DFU
 #endif
 	sys_poweroff();
 	return true;
@@ -427,7 +421,6 @@ static bool sys_system_off(void) // TODO: add timeout
 	wait_for_logging();
 #if ADAFRUIT_BOOTLOADER // if using Adafruit bootloader, always skip dfu for next boot
 	NRF_POWER->GPREGRET = ADAFRUIT_DFU_MAGIC_SKIP;
-	(*dbl_reset_mem) = DFU_DBL_RESET_APP; // Skip DFU
 #endif
 	sys_poweroff();
 	return true;
@@ -449,8 +442,11 @@ static void sys_system_reboot(void) // TODO: add timeout
 	sys_update_battery_tracker(power_battery_current_pptt(), power_battery_device_plugged());
 //	retained_update();
 	wait_for_logging();
-#if ADAFRUIT_BOOTLOADER // if using Adafruit bootloader, always skip dfu for next boot
-	(*dbl_reset_mem) = DFU_DBL_RESET_APP; // Skip DFU
+#if ADAFRUIT_BOOTLOADER
+	/* Preserve an explicit UF2/OTA request already placed in GPREGRET by the caller. */
+	if (NRF_POWER->GPREGRET == 0) {
+		NRF_POWER->GPREGRET = ADAFRUIT_DFU_MAGIC_SKIP;
+	}
 #endif
 	sys_reboot(SYS_REBOOT_COLD);
 }
@@ -501,7 +497,10 @@ bool vbus_read(void)
 static void disable_DFU_thread(void)
 {
 #if ADAFRUIT_BOOTLOADER
-	(*dbl_reset_mem) = DFU_DBL_RESET_APP; // Skip DFU
+	/* Use the bootloader register command; its fixed double-reset RAM word may alias application BSS. */
+	if (NRF_POWER->GPREGRET == 0) {
+		NRF_POWER->GPREGRET = ADAFRUIT_DFU_MAGIC_SKIP;
+	}
 #endif
 }
 
