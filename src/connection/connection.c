@@ -44,59 +44,33 @@
 
 static uint8_t tracker_id, batt, batt_v, sensor_temp, imu_id, mag_id, tracker_status;
 static uint8_t tracker_svr_status = SVR_STATUS_OK;
-/*
- * Seqlock publish: sensor thread writes, connection thread reads.
- * Odd seq = write in progress; reader retries. No irq_lock.
- */
+/* Published under irq_lock so connection_thread never reads torn sensor data. */
 static float sensor_q[4], sensor_a[3], sensor_m[3];
 static bool send_precise_quat;
-static atomic_t sensor_qa_seq;
-static atomic_t sensor_m_seq;
 static bool sensor_ids_set = false; /* true after connection_update_sensor_ids() first called */
 static K_SEM_DEFINE(connection_wake_sem, 0, 1);
 
 static void connection_sensor_snap_q_a(float q_out[4], float a_out[3])
 {
-	unsigned s;
-	do {
-		s = (unsigned)atomic_get(&sensor_qa_seq);
-		if (s & 1U) {
-			k_yield(); /* writer mid-update; never busy-spin to WDT */
-			continue;
-		}
-		memcpy(q_out, sensor_q, sizeof(sensor_q));
-		memcpy(a_out, sensor_a, sizeof(sensor_a));
-	} while ((unsigned)atomic_get(&sensor_qa_seq) != s);
+	unsigned key = irq_lock();
+	memcpy(q_out, sensor_q, sizeof(sensor_q));
+	memcpy(a_out, sensor_a, sizeof(sensor_a));
+	irq_unlock(key);
 }
 
 static void connection_sensor_snap_q_m(float q_out[4], float m_out[3])
 {
-	unsigned sq;
-	unsigned sm;
-	do {
-		sq = (unsigned)atomic_get(&sensor_qa_seq);
-		sm = (unsigned)atomic_get(&sensor_m_seq);
-		if ((sq | sm) & 1U) {
-			k_yield();
-			continue;
-		}
-		memcpy(q_out, sensor_q, sizeof(sensor_q));
-		memcpy(m_out, sensor_m, sizeof(sensor_m));
-	} while ((unsigned)atomic_get(&sensor_qa_seq) != sq || (unsigned)atomic_get(&sensor_m_seq) != sm);
+	unsigned key = irq_lock();
+	memcpy(q_out, sensor_q, sizeof(sensor_q));
+	memcpy(m_out, sensor_m, sizeof(sensor_m));
+	irq_unlock(key);
 }
 
 static bool connection_sensor_get_precise_quat(void)
 {
-	unsigned s;
-	bool precise;
-	do {
-		s = (unsigned)atomic_get(&sensor_qa_seq);
-		if (s & 1U) {
-			k_yield();
-			continue;
-		}
-		precise = send_precise_quat;
-	} while ((unsigned)atomic_get(&sensor_qa_seq) != s);
+	unsigned key = irq_lock();
+	bool precise = send_precise_quat;
+	irq_unlock(key);
 	return precise;
 }
 
@@ -388,12 +362,15 @@ void connection_update_sensor_data(float *q, float *a, int64_t data_time)
 		return;
 	}
 
-	unsigned s = (unsigned)atomic_get(&sensor_qa_seq);
-	atomic_set(&sensor_qa_seq, (atomic_val_t)(s + 1U)); /* odd = writing */
-	send_precise_quat = q_epsilon(q, sensor_q, 0.005f);
+	/* This is the only writer, so the expensive quaternion comparison can run
+	 * before the short publish critical section.
+	 */
+	bool precise_quat = q_epsilon(q, sensor_q, 0.005f);
+	unsigned key = irq_lock();
+	send_precise_quat = precise_quat;
 	memcpy(sensor_q, q, sizeof(sensor_q));
 	memcpy(sensor_a, a, sizeof(sensor_a));
-	atomic_set(&sensor_qa_seq, (atomic_val_t)(s + 2U)); /* even = stable */
+	irq_unlock(key);
 	quat_update_time = k_uptime_get();
 	connection_signal_wake();
 }
@@ -403,10 +380,9 @@ static int64_t last_mag_time = 0;
 
 void connection_update_sensor_mag(float *m)
 {
-	unsigned s = (unsigned)atomic_get(&sensor_m_seq);
-	atomic_set(&sensor_m_seq, (atomic_val_t)(s + 1U));
+	unsigned key = irq_lock();
 	memcpy(sensor_m, m, sizeof(sensor_m));
-	atomic_set(&sensor_m_seq, (atomic_val_t)(s + 2U));
+	irq_unlock(key);
 	mag_update_time = k_uptime_get();
 	connection_signal_wake();
 }

@@ -18,6 +18,7 @@
 #include <zephyr/logging/log.h>
 #include <zephyr/sys/reboot.h>
 #include <hal/nrf_power.h>
+#include <hal/nrf_wdt.h>
 
 LOG_MODULE_REGISTER(watchdog, LOG_LEVEL_INF);
 
@@ -68,47 +69,36 @@ static const uint32_t default_timeouts[] = {
 static void watchdog_timeout_callback(int channel_id, void *user_data)
 {
 	wdt_channel_id_t channel = (wdt_channel_id_t)(intptr_t)user_data;
+	uint32_t uptime_ms = k_uptime_get_32();
 
-	/* Disable interrupts to prevent being interrupted */
-	unsigned int key = irq_lock();
+	ARG_UNUSED(channel_id);
 
 	/* Save fault information to retained memory (outside CRC, no update needed) */
 	if (retained) {
 		retained->watchdog_state.last_failed_channel = channel;
-		retained->watchdog_state.last_reset_uptime = k_uptime_get_32();
+		retained->watchdog_state.last_reset_uptime = uptime_ms;
 		retained->watchdog_state.magic = WATCHDOG_STATE_MAGIC;
 	}
 
-	/* Log critical failure information */
-	LOG_ERR("=== WATCHDOG TIMEOUT ===");
-	LOG_ERR("Failed channel: %d (%s)", channel_id, channel_names[channel]);
-	LOG_ERR("System uptime: %u ms", k_uptime_get_32());
-
-	/* Important: When a callback is provided to task_wdt_add(), the task_wdt
-	 * does NOT automatically reboot. The hardware WDT fallback will only
-	 * trigger if we don't return from this callback. We spin here to let
-	 * the hardware WDT timeout and reset the system.
+	/* A task_wdt callback suppresses its automatic reboot. If the hardware WDT
+	 * is running, stop all software progress and let it issue a DOG reset. Unlike
+	 * an NVIC soft reset, DOG also resets the WDT itself and preserves the native
+	 * reset reason used by the consecutive-reset/DFU recovery logic.
 	 */
-	LOG_ERR("Waiting for hardware WDT to reset system...");
-
-	/* Spin forever - hardware WDT will reset the system */
-	uint32_t start_cycles = k_cycle_get_32();
-	uint32_t last_print_ms = 0;
-
-	while (1) {
-		/* Calculate elapsed time and print status every second */
-		uint32_t elapsed_ms = k_cyc_to_ms_floor32(k_cycle_get_32() - start_cycles);
-		if (elapsed_ms >= last_print_ms + 1000) {
-			printk("WDT: Still waiting... %u ms\n", elapsed_ms);
-			last_print_ms = elapsed_ms;
+	if (nrf_wdt_started_check(NRF_WDT)) {
+		(void)irq_lock();
+		for (;;) {
+			/* The always-on hardware WDT resets the system within its fallback
+			 * timeout. No thread or timer can feed it after irq_lock().
+			 */
+			__NOP();
 		}
-
-		/* Small delay to reduce CPU load */
-		k_busy_wait(1000);
 	}
 
-	/* Restore interrupts (unreachable, but for completeness) */
-	irq_unlock(key);
+	/* Zephyr v3.2 task_wdt does not propagate a failed hardware wdt_setup().
+	 * If no hardware WDT is active, a soft reset is the only reliable escape.
+	 */
+	sys_reboot(SYS_REBOOT_COLD);
 }
 
 /**

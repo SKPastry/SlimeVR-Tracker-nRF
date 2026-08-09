@@ -9,6 +9,7 @@ on:
       - dev
       - devc
       - "feat/**"
+      - "fix/**"
     tags:
       - "*"
   create:
