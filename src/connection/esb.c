@@ -23,6 +23,7 @@
 #include "globals.h"
 #include "sensor/calibration/calibration.h"
 #include "sensor/sensor.h"
+#include "system/power.h"
 #include "system/system.h"
 #include "system/test_mode.h"
 #include "system/watchdog.h"
@@ -143,6 +144,12 @@ static void esb_remote_cmd_shutdown(void)
 {
 	LOG_WRN("Executing remote command: SHUTDOWN");
 	sys_command_shutdown();
+}
+
+static void esb_remote_cmd_wom(void)
+{
+	LOG_WRN("Executing remote command: WOM");
+	sys_request_WOM(true, false);
 }
 
 static void esb_remote_cmd_calibrate(void)
@@ -488,6 +495,7 @@ static void esb_remote_cmd_ota_unsuppress(void)
 
 static const struct esb_remote_cmd esb_remote_cmds[] = {
 	{ESB_PONG_FLAG_SHUTDOWN, "SHUTDOWN", esb_remote_cmd_shutdown},
+	{ESB_PONG_FLAG_WOM, "WOM", esb_remote_cmd_wom},
 	{ESB_PONG_FLAG_CALIBRATE, "CALIBRATE", esb_remote_cmd_calibrate},
 	{ESB_PONG_FLAG_SIX_SIDE_CAL, "SIX_SIDE_CAL", esb_remote_cmd_six_side_cal},
 	{ESB_PONG_FLAG_MEOW, "MEOW", esb_remote_cmd_meow},
