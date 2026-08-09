@@ -86,4 +86,10 @@ void set_led(enum sys_led_pattern led_pattern, int priority);
 void set_led_color(enum sys_led_pattern led_pattern, enum sys_led_color color, int priority);
 void set_led_rgb(enum sys_led_pattern led_pattern, struct sys_led_rgb_pptt color, int priority);
 
+/* Latch the final shutdown state. Power-gated strips are disabled immediately;
+ * other LED hardware waits for the worker's off sequence. All later LED
+ * requests are ignored until reset.
+ */
+void led_force_off_sync(void);
+
 #endif

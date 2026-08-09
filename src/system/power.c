@@ -194,7 +194,7 @@ static void configure_system_off(void)
 	clock_pre_shutdown();
 	main_imu_suspend();
 	sensor_shutdown();
-	set_led(SYS_LED_PATTERN_OFF_FORCE, SYS_LED_PRIORITY_HIGHEST);
+	led_force_off_sync();
 	float actual_clock_rate;
 	set_sensor_clock(false, 0, &actual_clock_rate);
 	// Configure interrupts
