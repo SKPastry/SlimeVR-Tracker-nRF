@@ -1,0 +1,7 @@
+tests:
+  customer_info.parser:
+    tags:
+      - customer_info
+    platform_allow:
+      - native_sim/native/64
+    harness: ztest

@@ -69,6 +69,24 @@ factory HEX 逐字节保留现有 Bootloader，因此不会改变 BL UF2 自升�
 选择更新文件。这是现有 BL 更新流程的限制，factory HEX 合并既不引入也不修复该
 问题；正式量产前应单独决定是否分配唯一标识。
 
+## CUSTOMER 启动诊断
+
+P00/P10 Tracker 从 `0.1.1.2` 开始会在正常 App 启动时只读快照 nRF52840 UICR
+CUSTOMER 槽 A/B，并解析当前工程样例 `SKT0/schema 1`。功能不会启用 NVMC，也不会
+写入、纠正或擦除 UICR。RTT 启动日志、USB 控制台连接横幅和交互式 `info` 命令会
+输出同一份缓存结果。
+
+- 普通 `factory-test.hex` 不含 CUSTOMER，设备应报告 A/B 均为擦除态；
+- `factory-SAMPLE.hex` 只写槽 A，记录和板型匹配时会输出产品、硬件版本、区域、
+  批次、生产日期、出厂 App 版本、provenance 前缀和 CRC；
+- 旧 schema、未知格式、字段或 CRC 损坏、板型身份不匹配及槽 B 意外非空只会产生
+  明确告警，不得阻止后续启动；
+- 槽 B 当前必须全为 `0xFF`，固件不会把它作为回退记录解析。
+
+无效记录中的字符串不会作为身份输出。CRC-32/ISO-HDLC 仅用于检测意外损坏，不是
+签名，不能证明记录来源、阻止克隆或提供区域/功能授权。`CUSTOMER:` 日志是人工诊断
+文本，不是冻结的生产测试机器接口。
+
 ## 生成 factory HEX
 
 先确认输入确实是预期的测试构建：

@@ -10,6 +10,27 @@ config USE_SLIMENRF_CONSOLE
     help
         Use basic console for commands.
 
+config SK_CHEESECAKE_CUSTOMER_INFO
+    bool
+    depends on SOC_NRF52840 && (BOARD_SK_CHEESECAKE_NRF_P00 || BOARD_SK_CHEESECAKE_NRF_P10)
+    default y
+    help
+        Read and report the SKT0 engineering SAMPLE record from UICR
+        CUSTOMER on supported SK CheeseCake boards. This feature is read-only.
+
+config SK_CHEESECAKE_CUSTOMER_PRODUCT_ID
+    int
+    depends on SK_CHEESECAKE_CUSTOMER_INFO
+    range 0 65535
+    default 1
+
+config SK_CHEESECAKE_CUSTOMER_HARDWARE_REVISION
+    int
+    depends on SK_CHEESECAKE_CUSTOMER_INFO
+    range 0 65535
+    default 0 if BOARD_SK_CHEESECAKE_NRF_P00
+    default 10 if BOARD_SK_CHEESECAKE_NRF_P10
+
 choice
 	prompt "Battery voltage mapping"
     default BATTERY_USE_REG_LDO_MAPPING

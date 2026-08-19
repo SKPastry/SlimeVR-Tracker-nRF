@@ -2,6 +2,9 @@
 #include "system/system.h"
 #include "system/battery_tracker.h"
 #include "system/test_mode.h"
+#if defined(CONFIG_SK_CHEESECAKE_CUSTOMER_INFO)
+#include "system/customer_info.h"
+#endif
 #include "sensor/sensor.h"
 #include "sensor/calibration/calibration.h"
 #if CONFIG_VQF_BENCH
@@ -476,6 +479,10 @@ static void print_battery(void)
 static void print_info(void)
 {
 	print_board();
+#if defined(CONFIG_SK_CHEESECAKE_CUSTOMER_INFO)
+	printk("\n");
+	customer_info_print();
+#endif
 	printk("\n");
 	print_sensor_summary();
 	printk("\n");
@@ -1740,6 +1747,9 @@ static void console_thread(void)
 #endif
 	printk(FW_STRING);
 	printk("Repo: %s | Branch: %s\n", FW_GIT_REPO_URL, FW_GIT_BRANCH);
+#if USB_EXISTS && defined(CONFIG_SK_CHEESECAKE_CUSTOMER_INFO)
+	customer_info_print();
+#endif
 
 	printk("Type 'help' to show available commands.\n");
 

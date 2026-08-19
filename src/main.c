@@ -22,6 +22,9 @@
 */
 #include "globals.h"
 #include "system/system.h"
+#if defined(CONFIG_SK_CHEESECAKE_CUSTOMER_INFO)
+#include "system/customer_info.h"
+#endif
 // #include "timer.h"
 #include "connection/esb.h"
 #include "sensor/sensor.h"
@@ -54,6 +57,10 @@ LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
 
 int main(void)
 {
+#if defined(CONFIG_SK_CHEESECAKE_CUSTOMER_INFO)
+	customer_info_init();
+	customer_info_log_status();
+#endif
 #if DT_NODE_HAS_PROP(ZEPHYR_USER_NODE, gnd_gpios)
 	gpio_pin_configure_dt(&gnd, GPIO_OUTPUT_ACTIVE);
 	gpio_pin_set_dt(&gnd, 0);
