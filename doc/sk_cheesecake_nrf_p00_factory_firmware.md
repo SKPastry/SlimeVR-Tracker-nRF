@@ -211,7 +211,7 @@ nrfjprog \
   --reset
 ```
 
-首次启动时 Bootloader 可能需要写入 `UICR.REGOUT0=3.3V` 并额外复位一次，这是预期
+首次启动时 Bootloader 可能需要写入 `UICR.REGOUT0=2.7V` 并额外复位一次，这是预期
 行为。全片擦除后的 settings 页为空，现有 Bootloader 会通过 `0x1000` 处的 App
 向量表验证并启动这个直接烧录的 App。不要把 factory HEX 或 Bootloader UF2 交给
 ESB App OTA 工具。
