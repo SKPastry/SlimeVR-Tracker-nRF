@@ -5,6 +5,23 @@
 #include <zephyr/dt-bindings/led/led.h>
 
 &pinctrl {
+	i2c0_default: i2c0_default {
+		group1 {
+			psels = <NRF_PSEL(TWIM_SDA, 0, 26)>,
+				<NRF_PSEL(TWIM_SCL, 0, 4)>;
+			bias-disable;
+		};
+	};
+
+	i2c0_sleep: i2c0_sleep {
+		group1 {
+			psels = <NRF_PSEL(TWIM_SDA, 0, 26)>,
+				<NRF_PSEL(TWIM_SCL, 0, 4)>;
+			bias-disable;
+			low-power-enable;
+		};
+	};
+
 	i2s0_default: i2s0_default {
 		group1 {
 			psels = <NRF_PSEL(I2S_SCK_M, 1, 5)>,
@@ -41,17 +58,17 @@
 
 	spi3_default: spi3_default {
 		group1 {
-			psels = <NRF_PSEL(SPIM_MISO, 0, 4)>,
-				<NRF_PSEL(SPIM_MOSI, 0, 6)>,
-				<NRF_PSEL(SPIM_SCK, 0, 8)>;
+			psels = <NRF_PSEL(SPIM_MISO, 0, 8)>,
+				<NRF_PSEL(SPIM_MOSI, 1, 9)>,
+				<NRF_PSEL(SPIM_SCK, 0, 12)>;
 		};
 	};
 
 	spi3_sleep: spi3_sleep {
 		group1 {
-			psels = <NRF_PSEL(SPIM_MISO, 0, 4)>,
-				<NRF_PSEL(SPIM_MOSI, 0, 6)>,
-				<NRF_PSEL(SPIM_SCK, 0, 8)>;
+			psels = <NRF_PSEL(SPIM_MISO, 0, 8)>,
+				<NRF_PSEL(SPIM_MOSI, 1, 9)>,
+				<NRF_PSEL(SPIM_SCK, 0, 12)>;
 			low-power-enable;
 		};
 	};
@@ -98,8 +115,8 @@
 	};
 
 	zephyr,user {
-		int0-gpios = <&gpio0 26 0>;
-		pwr-gpios = <&gpio0 12 GPIO_ACTIVE_HIGH>;
+		int0-gpios = <&gpio0 6 0>;
+		pwr-gpios = <&gpio0 14 GPIO_ACTIVE_HIGH>;
 		heat-en-gpios = <&gpio0 31 GPIO_ACTIVE_HIGH>;
 		led-en-gpios = <&gpio1 6 GPIO_ACTIVE_HIGH>;
 		eclk-en-gpios = <&gpio1 11 GPIO_ACTIVE_HIGH>;
@@ -131,6 +148,21 @@
 
 &gpio1 {
 	status = "okay";
+};
+
+&i2c0 {
+	compatible = "nordic,nrf-twim";
+	status = "okay";
+	clock-frequency = <I2C_BITRATE_FAST>;
+	pinctrl-0 = <&i2c0_default>;
+	pinctrl-1 = <&i2c0_sleep>;
+	pinctrl-names = "default", "sleep";
+
+	mag: mag@0 {
+		compatible = "i2c-device";
+		label = "mag";
+		reg = <0>;
+	};
 };
 
 &i2s0 {
@@ -185,7 +217,7 @@ zephyr_udc0: &usbd {
 	pinctrl-0 = <&spi3_default>;
 	pinctrl-1 = <&spi3_sleep>;
 	pinctrl-names = "default", "sleep";
-	cs-gpios = <&gpio1 9 GPIO_ACTIVE_LOW>;
+	cs-gpios = <&gpio0 13 GPIO_ACTIVE_LOW>;
 
 	imu_spi: imu_spi@0 {
 		compatible = "vnd,spi-device";
