@@ -25,6 +25,7 @@
 #if defined(CONFIG_SK_CHEESECAKE_CUSTOMER_INFO)
 #include "system/customer_info.h"
 #endif
+#include "system/uptime.h"
 // #include "timer.h"
 #include "connection/esb.h"
 #include "sensor/sensor.h"
@@ -46,14 +47,14 @@ static const struct gpio_dt_spec gnd = GPIO_DT_SPEC_GET(ZEPHYR_USER_NODE, gnd_gp
 #warning "IMU gnd pins not defined: do not stack IMU on PROMICRO"
 #endif // CONFIG_BOARD_PROMICRO_UF2
 #endif
+
 LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
 
 #if DT_NODE_HAS_PROP(DT_ALIAS(sw0), gpios)
 #define BUTTON_EXISTS true
 #endif
 
-#define DFU_EXISTS (CONFIG_BUILD_OUTPUT_UF2 || CONFIG_BOARD_HAS_NRF5_BOOTLOADER)
-#define ADAFRUIT_BOOTLOADER CONFIG_BUILD_OUTPUT_UF2
+#define ADAFRUIT_BOOTLOADER (CONFIG_BUILD_OUTPUT_UF2 && !CONFIG_BOOTLOADER_MCUBOOT)
 
 int main(void)
 {
@@ -98,10 +99,10 @@ int main(void)
 
 	if (button_read()) {
 		while (button_read()) {
-			if (k_uptime_get() > 1000) {
+			if (system_uptime_since_boot_ms() > 1000) {
 				set_led(SYS_LED_PATTERN_LONG, SYS_LED_PRIORITY_HIGHEST);
 			}
-			if (k_uptime_get() > 5000) {
+			if (system_uptime_since_boot_ms() > 5000) {
 #if CONFIG_USER_EXTRA_ACTIONS
 				LOG_INF("Button long hold timeout, continuing boot");
 #else
@@ -113,11 +114,11 @@ int main(void)
 			k_msleep(1);
 		}
 #if USER_SHUTDOWN_ENABLED
-		if (k_uptime_get() < 50 && booting_from_shutdown) { // debounce
+		if (system_uptime_since_boot_ms() < 50 && booting_from_shutdown) { // debounce
 			sys_request_system_off(false);
 		}
 #endif
-		if (k_uptime_get() <= 5000) {
+		if (system_uptime_since_boot_ms() <= 5000) {
 			set_led(SYS_LED_PATTERN_ONESHOT_POWERON, SYS_LED_PRIORITY_HIGHEST);
 		} else {
 			set_led(SYS_LED_PATTERN_OFF, SYS_LED_PRIORITY_HIGHEST);
@@ -143,8 +144,7 @@ int main(void)
 		LOG_INF("Reset count: %u", reboot_counter);
 #if ADAFRUIT_BOOTLOADER                                                                                                \
 	&& !(IGNORE_RESET && BUTTON_EXISTS)       // Using Adafruit bootloader, skip DFU if reset button is in use
-		/* The bootloader's fixed double-reset RAM word can alias application BSS. */
-		NRF_POWER->GPREGRET = ADAFRUIT_DFU_MAGIC_SKIP;
+		sys_skip_dfu(); // Skip DFU
 #endif
 		k_msleep(1000); // Wait before clearing counter and continuing
 	}

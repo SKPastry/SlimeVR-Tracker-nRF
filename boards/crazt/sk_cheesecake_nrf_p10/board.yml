@@ -3,6 +3,7 @@
 
 board:
   name: sk_cheesecake_nrf_p10
+  full_name: SK CheeseCake NRF P10
   vendor: crazt
   socs:
     - name: nrf52840

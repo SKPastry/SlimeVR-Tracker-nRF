@@ -64,6 +64,7 @@ bool sensor_calibration_get_online_mag_enabled(void);
 void sensor_calibration_online_mag_retained_save(void);
 void sensor_calibration_online_mag_retained_clear(void);
 void sensor_calibration_online_mag_cold_start(void);
+void sensor_calibration_online_mag_prepare_power_down(void);
 
 #if CONFIG_SENSOR_USE_TCAL
 
