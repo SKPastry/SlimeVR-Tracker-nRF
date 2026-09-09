@@ -79,6 +79,17 @@ config LED_GLOBAL_BRIGHTNESS_PPTT
         Scale LED output brightness in parts per ten-thousand.
         10000 is full brightness, 2500 is 25%.
 
+config SK_LED_SYNC
+    bool "SK: synchronize breathing LEDs with the receiver clock"
+    depends on !SMP
+    default y if BOARD_SK_CHEESECAKE_NRF_P00 || BOARD_SK_CHEESECAKE_NRF_P10
+    default n
+    help
+        Downstream LED feature: synchronize the three breathing patterns
+        using the existing receiver clock, with 4-second slow and 2-second
+        fast periods. Continue locally when synchronization is unavailable.
+        Disabling this restores the original local 5/2-second patterns.
+
 menu "Status LED default status color"
     depends on LED_RGB_COLOR
 

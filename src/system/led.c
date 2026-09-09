@@ -7,6 +7,7 @@
 #include <zephyr/pm/device.h>
 
 #include "led.h"
+#include "sk_led_sync.h"
 
 LOG_MODULE_REGISTER(led, LOG_LEVEL_INF);
 
@@ -683,7 +684,7 @@ static void led_thread(void)
 			k_msleep(200);
 			break;
 		case SYS_LED_PATTERN_BREATH_SLOW:
-			led_pattern_state = (led_pattern_state + 1) % 1000;
+			led_pattern_state = sk_led_sync_phase(led_pattern_state, SK_LED_SYNC_SLOW_TICKS);
 			led_pin_set(
 				led_effective_color(SYS_LED_COLOR_DEFAULT),
 				10000,
@@ -692,7 +693,7 @@ static void led_thread(void)
 			k_msleep(5);
 			break;
 		case SYS_LED_PATTERN_BREATH_FAST:
-			led_pattern_state = (led_pattern_state + 1) % 1000;
+			led_pattern_state = sk_led_sync_phase(led_pattern_state, SK_LED_SYNC_FAST_TICKS);
 			led_pin_set(
 				led_effective_color(SYS_LED_COLOR_DEFAULT),
 				10000,
@@ -777,7 +778,7 @@ static void led_thread(void)
 			k_msleep(500);
 			break;
 		case SYS_LED_PATTERN_PULSE_PERSIST:
-			led_pattern_state = (led_pattern_state + 1) % 1000;
+			led_pattern_state = sk_led_sync_phase(led_pattern_state, SK_LED_SYNC_SLOW_TICKS);
 			//			float led_value = sinf(led_pattern_state * (M_PI / 1000));
 			//			led_pin_set(SYS_LED_COLOR_CHARGING, 10000, led_value * 10000);
 			led_pin_set(

@@ -47,6 +47,9 @@
 #endif
 #include "console.h"
 #include "system/clock_control.h"
+#if defined(CONFIG_SK_LED_SYNC)
+#include "system/sk_led_sync.h"
+#endif
 
 uint8_t last_reset = 0;
 bool esb_state = false;
@@ -2177,6 +2180,39 @@ void esb_get_ping_request_data(uint8_t out[4])
 	}
 	irq_unlock(key);
 }
+
+#if defined(CONFIG_SK_LED_SYNC)
+void sk_led_sync_read_clock(struct sk_led_clock_sample *sample)
+{
+	/* Private LED-thread reader on a single-core target. ESB updates these
+	 * fields in its regular ISR; copy them with one local timestamp before
+	 * doing conversions outside the critical section. Pairing invalidates
+	 * the snapshot while the thread-side reset is in progress. */
+	unsigned int key = irq_lock();
+	uint64_t kernel_now = k_uptime_ticks();
+	bool synchronized = esb_initialized && esb_conn_state != ESB_ST_PAIRING && server_time_synced;
+	int64_t last_sync_ms = g_last_sync_timestamp;
+	uint32_t offset = g_server_ticks_offset;
+	uint32_t reference_ticks = g_last_sync_local_ticks;
+	int32_t skew_ppb = g_clock_skew_ppb;
+	irq_unlock(key);
+
+	sample->local_ticks = (uint32_t)net_ticks_from_kernel64(kernel_now);
+	sample->network_ticks = sample->local_ticks;
+	sample->synchronized = false;
+	int64_t age_ms = (int64_t)k_ticks_to_ms_floor64(kernel_now) - last_sync_ms;
+	if (!synchronized || last_sync_ms == 0 || age_ms < 0 || age_ms > TIME_SYNC_TIMEOUT_MS) {
+		return;
+	}
+
+	uint32_t elapsed = sample->local_ticks - reference_ticks;
+	int64_t correction = (int64_t)skew_ppb * elapsed / 1000000000LL;
+	/* Deliberately modulo 2^32: never sign-extend an offset into a guessed
+	 * receiver epoch, and never use zero as a missing-time sentinel. */
+	sample->network_ticks = sample->local_ticks + offset + (uint32_t)correction;
+	sample->synchronized = true;
+}
+#endif
 
 uint64_t esb_get_server_time_ticks_64(void)
 {
