@@ -38,7 +38,7 @@ LOG_MODULE_REGISTER(system, LOG_LEVEL_INF);
 static void button_thread(void);
 K_THREAD_DEFINE(
 	button_thread_id,
-	1024,
+	768,
 	button_thread,
 	NULL,
 	NULL,
@@ -567,6 +567,7 @@ int set_sensor_clock(bool enable, float rate, float *actual_rate)
 static const struct gpio_dt_spec button0 = GPIO_DT_SPEC_GET(DT_ALIAS(sw0), gpios);
 static int64_t press_time = 0;
 static int64_t last_press_duration = 0;
+bool button_held_from_init;
 
 #if TCAL_BUTTON_EXISTS
 static const struct gpio_dt_spec tcal_button = GPIO_DT_SPEC_GET(DT_ALIAS(sw1), gpios);
@@ -581,6 +582,9 @@ static void button_interrupt_handler(const struct device *dev, struct gpio_callb
 {
 	bool pressed = button_read();
 	int64_t current_time = k_uptime_get();
+	if (!pressed && button_held_from_init) { // after first depress, now allow events that need unambiguous button hold
+		button_held_from_init = false;
+	}
 	if (press_time && !pressed && current_time - press_time > 50) { // debounce
 		last_press_duration = current_time - press_time;
 	} else if (press_time && pressed) { // unusual press event on button already pressed
@@ -593,6 +597,16 @@ static struct gpio_callback button_cb_data;
 
 static int sys_button_init(void)
 {
+#ifdef NRF_RESET
+#ifdef RESET_RESETREAS_VBUS_Msk
+	bool reset_vbus_reset = NRF_RESET->RESETREAS & RESET_RESETREAS_VBUS_Msk;
+#else
+	/* SoCs without USB (e.g. nRF54L15) have no VBUS reset reason. */
+	bool reset_vbus_reset = false;
+#endif
+#else
+	bool reset_vbus_reset = NRF_POWER->RESETREAS & POWER_RESETREAS_VBUS_Msk;
+#endif
 	gpio_pin_configure_dt(&button0, GPIO_INPUT);
 	gpio_pin_interrupt_configure_dt(&button0, GPIO_INT_EDGE_BOTH);
 	gpio_init_callback(&button_cb_data, button_interrupt_handler, BIT(button0.pin));
@@ -605,11 +619,23 @@ static int sys_button_init(void)
 		return err;
 	}
 #endif
+	if (!reset_vbus_reset) { // button held at init is only a deliberate hold if reset was not caused by VBUS (USB plug-in wake)
+		button_held_from_init = gpio_pin_get_dt(&button0);
+	}
 	return 0;
 }
 
 SYS_INIT(sys_button_init, APPLICATION, CONFIG_APPLICATION_INIT_PRIORITY);
 #endif
+
+bool button_read_filtered(void) // ignores initial press only if button was held since boot (e.g. wake key)
+{
+#if BUTTON_EXISTS // Alternate button if available to use as "reset key"
+	return button_held_from_init ? false : gpio_pin_get_dt(&button0);
+#else
+	return false;
+#endif
+}
 
 bool button_read(void)
 {

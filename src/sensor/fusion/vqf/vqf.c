@@ -169,7 +169,7 @@ static void set_params()
 	params.tauAcc = 3.8f;
 	params.biasClip = 5.0f;
 	params.biasForgettingTime = 100.0f;
-	params.biasSigmaInit = 0.8f;
+	params.biasSigmaInit = 1.0f;
 	params.biasSigmaMotion = 0.28f;
 	params.biasSigmaRest = 0.05f;
 	params.biasVerticalForgettingFactor = 0.0001f;
