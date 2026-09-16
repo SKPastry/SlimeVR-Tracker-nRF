@@ -31,6 +31,9 @@ void sys_interface_resume(void);
 void sys_request_WOM(bool force, bool immediate, enum sys_off_reason reason);
 void sys_request_system_off(bool immediate, enum sys_off_reason reason);
 void sys_request_system_reboot(bool immediate, enum sys_off_reason reason);
+/* Automatic (not user initiated) power-off: sleeps with IMU wake-up armed when the
+ * board supports it, so the tracker can still be woken by motion; otherwise system off. */
+void sys_request_auto_off(bool immediate, enum sys_off_reason reason);
 
 /* Power-off forensics: records are kept in retained RAM and mirrored to NVS.
  * Prints the most recent record (or all records) at INFO level. */

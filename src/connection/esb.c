@@ -1770,7 +1770,7 @@ void esb_pair(void)
 			if (!shutdown_requested && (k_uptime_get() - pair_start_time) > CONFIG_CONNECTION_TIMEOUT_DELAY) {
 				LOG_WRN("Pairing timeout after %dm", CONFIG_CONNECTION_TIMEOUT_DELAY / 60000);
 				shutdown_requested = true;
-				sys_request_system_off(false, SYS_OFF_REASON_PAIRING_TIMEOUT);
+				sys_request_auto_off(false, SYS_OFF_REASON_PAIRING_TIMEOUT);
 			}
 #endif
 			if (paired_addr[0]) {
@@ -2265,7 +2265,7 @@ static void esb_thread(void)
 			{
 				LOG_WRN("No response from receiver in %dm", CONFIG_CONNECTION_TIMEOUT_DELAY / 60000);
 				shutdown_requested = true;
-				sys_request_system_off(false, SYS_OFF_REASON_CONNECTION_TIMEOUT);
+				sys_request_auto_off(false, SYS_OFF_REASON_CONNECTION_TIMEOUT);
 			}
 #endif
 		}

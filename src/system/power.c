@@ -364,6 +364,16 @@ void sys_request_system_reboot(bool immediate, enum sys_off_reason reason)
 	sys_power_state_request(SYS_POWER_REQ_REBOOT, reason);
 }
 
+void sys_request_auto_off(bool immediate, enum sys_off_reason reason)
+{
+#if IMU_INT_EXISTS && CONFIG_USE_IMU_WAKE_UP
+	/* Keep int0 SENSE armed so motion (not only the button) can wake the tracker. */
+	sys_request_WOM(true, immediate, reason);
+#else
+	sys_request_system_off(immediate, reason);
+#endif
+}
+
 static const char *const sys_off_reason_names[SYS_OFF_REASON_COUNT] = {
 	[SYS_OFF_REASON_UNKNOWN] = "unknown",
 	[SYS_OFF_REASON_ACTIVITY_TIMEOUT] = "activity_timeout",
@@ -696,11 +706,15 @@ bool vbus_read(void)
 // TODO: this thread is handling reading charging state, battery state, dock state, and setting status/led
 // TODO: should be separated to be more clear in its function?
 // TODO: call into other thread for handling the system state
+/* Consecutive 0% battery iterations (100 ms loop) before powering off */
+#define BATTERY_DISCHARGED_SAMPLES 30
+
 static void power_thread(void)
 {
 	static bool boot_success_checked = false;
 	static bool watchdog_registered = false;
 	static bool ota_gpregret_logged = false;
+	static uint8_t battery_discharged_count = 0;
 
 	/* Register power thread with watchdog (watchdog is initialized via SYS_INIT) */
 	if (!watchdog_registered) {
@@ -802,8 +816,22 @@ static void power_thread(void)
 		bool plug_state_debouncing = power_battery_update_plugged_state(raw_device_plugged, now_ms);
 		bool plug_signal_settling = power_battery_plug_signal_settling(plug_state_debouncing, now_ms);
 		int32_t average_pptt = power_battery_average_pptt();
-		bool battery_discharged = !plug_signal_settling && battery_available
+		bool battery_discharged_sample = !plug_signal_settling && battery_available
 			&& (average_pptt >= 0 ? average_pptt : battery_pptt) == 0;
+		/* A single 0% sample is not trusted: the filter restarts on large jumps, so one
+		 * glitched ADC read would otherwise power the tracker off (without wake-up) with a
+		 * healthy battery. Require consecutive 0% iterations (~100 ms each). */
+		if (battery_discharged_sample) {
+			if (battery_discharged_count < BATTERY_DISCHARGED_SAMPLES) {
+				battery_discharged_count++;
+			}
+			if (battery_discharged_count == 1) {
+				LOG_WRN("Battery reads 0%% (%d mV), confirming", battery_mV);
+			}
+		} else {
+			battery_discharged_count = 0;
+		}
+		bool battery_discharged = battery_discharged_count >= BATTERY_DISCHARGED_SAMPLES;
 		last_battery_mV = battery_mV;
 
 		power_battery_set_charged(charged); // TODO: timer on device_plugged could be used to infer charged state
@@ -830,7 +858,7 @@ static void power_thread(void)
 		{
 			if (battery_discharged)
 			{
-				LOG_WRN("Discharged battery");
+				LOG_WRN("Discharged battery (%u consecutive 0%% samples, %d mV)", battery_discharged_count, battery_mV);
 				sys_update_battery_tracker(0, device_plugged);
 			}
 			/* Genuinely empty battery / docked: full system off (no motion wake) is intended. */
