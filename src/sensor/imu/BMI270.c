@@ -371,6 +371,7 @@ uint8_t bmi_setup_WOM(void) // TODO: seems too sensitive? try to match icm at le
 	err |= ssi_reg_write_byte(SENSOR_INTERFACE_DEV_IMU, BMI270_PWR_CONF, 0x01); // enable adv_power_save (suspend)
 	if (err) {
 		LOG_ERR("Communication error");
+		return 0xFF;
 	}
 	// LOG_DBG("WOM setup complete");
 	return NRF_GPIO_PIN_PULLUP << 4 | NRF_GPIO_PIN_SENSE_LOW; // active low

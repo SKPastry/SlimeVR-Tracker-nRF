@@ -25,6 +25,8 @@
 
 struct retained_data *retained = (struct retained_data *)DT_REG_ADDR(MEMORY_REGION);
 
+BUILD_ASSERT(RETAINED_SIZE <= DT_REG_SIZE(MEMORY_REGION), "Retained data does not fit in the retained memory region");
+
 #define RETAINED_CRC_OFFSET offsetof(struct retained_data, crc)
 #define RETAINED_CHECKED_SIZE (RETAINED_CRC_OFFSET + sizeof(retained->crc))
 

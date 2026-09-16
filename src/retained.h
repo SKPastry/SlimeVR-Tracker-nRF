@@ -140,10 +140,54 @@ struct retained_data {
 		uint32_t total_wdt_resets;     // Cumulative WDT reset count (for debugging)
 		uint32_t magic;                // Magic number to validate watchdog state
 	} watchdog_state;
+
+	// Power-off forensics (outside CRC validation, mirrored to NVS).
+	// Written right before sys_poweroff()/sys_reboot() so the next boot can
+	// report how and why the previous session ended and whether IMU wake-up
+	// was actually armed.
+	struct power_off_log {
+		uint32_t magic;                // POWER_OFF_LOG_MAGIC
+		uint16_t seq;                  // Sequence number of the newest record
+		uint8_t next;                  // Ring index of the next record to write
+		uint8_t count;                 // Number of valid records
+		struct power_off_record {
+			uint16_t seq;
+			uint8_t path;              // enum power_off_path
+			uint8_t reason;            // enum sys_off_reason
+			uint8_t wom_result;        // enum sensor_wom_result
+			uint8_t imu_id;            // Detected IMU (0xFF if none)
+			uint8_t int0_config;       // pull << 4 | sense written for int0 (0xFF if not configured)
+			uint8_t wom_flags;         // POWER_OFF_WOM_FLAG_*
+			uint8_t wom_regs[4];       // IMU wake-up registers read back (driver specific order)
+			uint8_t idle_wake_streak;  // retained->wom_idle_wake_streak at power-off
+			uint8_t wdt_reset_count;   // Consecutive WDT resets before this session
+			uint8_t battery_pct;       // 0..100, 0xFF if unavailable
+			uint8_t reserved;
+			uint16_t battery_mv;
+			uint32_t int0_pin_cnf;     // PIN_CNF of int0 read back after configuring
+			uint32_t boot_resetreas;   // RESETREAS captured at boot of this session
+			uint32_t uptime_s;         // Session uptime at power-off
+		} rec[3];
+	} power_off_log;
 };
 
 /* Magic number to validate watchdog state */
 #define WATCHDOG_STATE_MAGIC 0x57445447  /* "WDTG" in ASCII */
+
+/* Magic number to validate the power-off log */
+#define POWER_OFF_LOG_MAGIC 0x504F4646  /* "POFF" in ASCII */
+#define POWER_OFF_LOG_DEPTH 3
+
+enum power_off_path {
+	POWER_OFF_PATH_NONE = 0,
+	POWER_OFF_PATH_WOM,        /* System OFF with IMU wake-up armed */
+	POWER_OFF_PATH_SYSTEM_OFF, /* System OFF, button/charger wake only */
+	POWER_OFF_PATH_REBOOT,
+};
+
+#define POWER_OFF_WOM_FLAG_WOKE_FROM_WOM 0x01 /* this session was started by IMU wake-up */
+#define POWER_OFF_WOM_FLAG_SLEEP_PENDING 0x02 /* retained->wom_sleep_pending set for the next boot */
+#define POWER_OFF_WOM_FLAG_MEANINGFUL_MOTION 0x04 /* meaningful motion seen during this session */
 
 /* Up to 4 KB of retained data allowed right now.
  */

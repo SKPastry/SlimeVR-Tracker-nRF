@@ -48,6 +48,7 @@ static uint32_t channel_timeouts[WDT_CHANNEL_COUNT];
 static bool watchdog_initialized = false;
 static bool boot_success_marked = false;
 static uint8_t saved_gpregret = 0;  /* Saved at PRE_KERNEL for OTA debug */
+static uint32_t saved_resetreas = 0; /* RESETREAS at boot, before it is cleared below */
 
 /* Channel names for logging */
 static const char *channel_names[] = {
@@ -213,12 +214,19 @@ static int watchdog_early_check(void)
 
 	/* Clear reset reason flags early to prevent other code from seeing stale values */
 #ifdef NRF_RESET
-	NRF_RESET->RESETREAS = NRF_RESET->RESETREAS;
+	saved_resetreas = NRF_RESET->RESETREAS;
+	NRF_RESET->RESETREAS = saved_resetreas;
 #else
-	NRF_POWER->RESETREAS = NRF_POWER->RESETREAS;
+	saved_resetreas = NRF_POWER->RESETREAS;
+	NRF_POWER->RESETREAS = saved_resetreas;
 #endif
 
 	return 0;
+}
+
+uint32_t watchdog_get_boot_resetreas(void)
+{
+	return saved_resetreas;
 }
 
 /* Run early check at PRE_KERNEL level, before anything else */

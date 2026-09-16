@@ -1164,6 +1164,7 @@ static void print_help(void)
 	printk("  info                       Get device information\n");
 	printk("  sensor                     Get sensor rates and calibration detail\n");
 	printk("  uptime                     Get device uptime\n");
+	printk("  lastoff                    Print the last power-off records (path, reason, wake-up state)\n");
 	printk("  battery                    Get battery information\n");
 	printk("\n");
 	printk("Sensor Management:\n");
@@ -1486,11 +1487,18 @@ static void console_cmd_shutdown(size_t argc, char **argv)
 	cmd_shutdown();
 }
 
+static void console_cmd_poweroff_log(size_t argc, char **argv)
+{
+	ARG_UNUSED(argc);
+	ARG_UNUSED(argv);
+	sys_power_off_log_print(true);
+}
+
 static void console_cmd_reboot(size_t argc, char **argv)
 {
 	ARG_UNUSED(argc);
 	ARG_UNUSED(argv);
-	sys_request_system_reboot(false);
+	sys_request_system_reboot(false, SYS_OFF_REASON_COMMAND);
 }
 
 static void console_cmd_battery(size_t argc, char **argv)
@@ -2146,6 +2154,7 @@ static const struct console_cmd console_cmds[] = {
 	{"info", console_cmd_info},
 	{"sensor", console_cmd_sensor},
 	{"uptime", console_cmd_uptime},
+	{"lastoff", console_cmd_poweroff_log},
 	{"shutdown", console_cmd_shutdown},
 	{"reboot", console_cmd_reboot},
 	{"battery", console_cmd_battery},

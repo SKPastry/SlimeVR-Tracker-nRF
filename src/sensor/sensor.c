@@ -1234,18 +1234,71 @@ void sensor_shutdown(void) // Communicate all imus to shut down
 	sys_interface_suspend();
 }
 
-uint8_t sensor_setup_WOM(void)
+uint8_t sensor_setup_WOM(uint8_t *result, uint8_t regs[SENSOR_WOM_REGS])
 {
+	memset(regs, 0, SENSOR_WOM_REGS);
+	*result = SENSOR_WOM_SETUP_FAILED;
 	int err = sensor_request_scan(false); // try initialization if possible
-	if (!err) {
-		sys_interface_resume();
-		err = sensor_imu->setup_WOM();
-		sys_interface_suspend();
-		return err;
+	if (err) {
+		LOG_ERR("Failed to configure IMU wake up");
+		/* 0xFF is not a valid nRF GPIO pull/sense pack; callers must fail closed. */
+		return 0xFF;
 	}
-	LOG_ERR("Failed to configure IMU wake up");
-	/* 0xFF is not a valid nRF GPIO pull/sense pack; callers must fail closed. */
-	return 0xFF;
+	uint8_t pin_config = 0xFF;
+	sys_interface_resume();
+	for (int attempt = 0; attempt < 2; attempt++) {
+		if (attempt > 0) {
+			/* Retry from a known state: soft reset the IMU, then configure again. */
+			LOG_WRN("Retrying IMU wake up setup after reset");
+			sensor_imu->shutdown();
+		}
+		pin_config = sensor_imu->setup_WOM();
+		if (pin_config == 0xFF || pin_config == 0) {
+			LOG_ERR("IMU wake up setup failed (attempt %d)", attempt + 1);
+			*result = SENSOR_WOM_SETUP_FAILED;
+			continue;
+		}
+		if (sensor_imu->verify_WOM == NULL) {
+			*result = SENSOR_WOM_UNVERIFIED;
+			break;
+		}
+		err = sensor_imu->verify_WOM(regs, SENSOR_WOM_REGS);
+		if (!err) {
+			*result = SENSOR_WOM_VERIFIED;
+			break;
+		}
+		LOG_ERR("IMU wake up verification failed (attempt %d): %d, regs %02X %02X %02X %02X", attempt + 1, err,
+				regs[0], regs[1], regs[2], regs[3]);
+		*result = SENSOR_WOM_VERIFY_FAILED;
+	}
+	sys_interface_suspend();
+	if (*result == SENSOR_WOM_SETUP_FAILED || *result == SENSOR_WOM_VERIFY_FAILED) {
+		LOG_ERR("Failed to configure IMU wake up");
+		return 0xFF;
+	}
+	return pin_config;
+}
+
+int sensor_get_imu_id(void)
+{
+	return sensor_imu_id;
+}
+
+uint8_t sensor_get_wom_session_flags(void)
+{
+	uint8_t flags = 0;
+#if CONFIG_DYNAMIC_ACTIVE_TIMEOUT
+	if (sensor_session_woke_from_wom) {
+		flags |= POWER_OFF_WOM_FLAG_WOKE_FROM_WOM;
+	}
+	if (sensor_session_meaningful_motion) {
+		flags |= POWER_OFF_WOM_FLAG_MEANINGFUL_MOTION;
+	}
+#endif
+	if (retained->wom_sleep_pending) {
+		flags |= POWER_OFF_WOM_FLAG_SLEEP_PENDING;
+	}
+	return flags;
 }
 
 static bool sensor_mag_uses_i2c_passthrough(void)
@@ -1310,7 +1363,7 @@ void sensor_set_mag_enabled(bool enabled)
 		bool val = enabled;
 		sys_write(MAG_ENABLED_ID, &retained->mag_enabled, &val, sizeof(val));
 		skip_fusion_save = true;
-		sys_request_system_reboot(false);
+		sys_request_system_reboot(false, SYS_OFF_REASON_MAG_TOGGLE);
 		return;
 	}
 
@@ -1572,13 +1625,18 @@ static void sensor_update_sensor_state(bool resting, float gyro_speed, float lin
 		int64_t active_timeout_delay = sensor_get_active_timeout_delay();
 		if (sensor_timeout == SENSOR_SENSOR_TIMEOUT_ACTIVITY && last_data_delta > active_timeout_delay) {
 			LOG_INF("No motion from sensors in %llds", active_timeout_delay / 1000);
+			enum sys_off_reason reason = active_timeout_delay < CONFIG_ACTIVE_TIMEOUT_DELAY
+											 ? SYS_OFF_REASON_IDLE_WAKE_TIMEOUT
+											 : SYS_OFF_REASON_ACTIVITY_TIMEOUT;
 #if CONFIG_SLEEP_ON_ACTIVE_TIMEOUT && CONFIG_USE_IMU_WAKE_UP
 			// Queue power state request, it is possible for the request to be overridden so the thread may continue
 			// unaware
-			sys_request_WOM(true, false);
+			sys_request_WOM(true, false, reason);
 #elif CONFIG_SHUTDOWN_ON_ACTIVE_TIMEOUT && CONFIG_USER_SHUTDOWN
 			// Queue power state request, thread will be suspended when entering system_off
-			sys_request_system_off(false);
+			sys_request_system_off(false, reason);
+#else
+			ARG_UNUSED(reason);
 #endif
 			sensor_timeout = SENSOR_SENSOR_TIMEOUT_ACTIVITY_ELAPSED; // only try to suspend once
 		}
@@ -1588,7 +1646,7 @@ static void sensor_update_sensor_state(bool resting, float gyro_speed, float lin
 		{
 			LOG_INF("No motion from sensors in %llds", imu_timeout / 1000);
 			// Queue power state request
-			sys_request_WOM(false, false);
+			sys_request_WOM(false, false, SYS_OFF_REASON_IMU_TIMEOUT);
 			sensor_timeout = SENSOR_SENSOR_TIMEOUT_IMU_ELAPSED; // only try to suspend once
 		}
 #endif
@@ -2702,7 +2760,7 @@ static void sensor_loop_check_packets(sensor_loop_frame_t *frame, int64_t time_b
 			set_status(SYS_STATUS_SENSOR_ERROR, true);
 			if (frame->packets) {
 				sensor_retained_write(); // keep the fusion state
-				sys_request_system_reboot(false);
+				sys_request_system_reboot(false, SYS_OFF_REASON_SENSOR_FAILURE);
 			}
 		}
 	} else if (frame->processed_packets == frame->packets && frame->packets > 0) {

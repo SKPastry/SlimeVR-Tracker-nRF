@@ -239,6 +239,9 @@ static int sys_retained_init(void)
 		if (retained->mag_online_calibration_mode > MAG_ONLINE_CALIBRATION_DISABLED) {
 			retained->mag_online_calibration_mode = MAG_ONLINE_CALIBRATION_DEFAULT;
 		}
+		/* Power-off forensics live outside the CRC; restore the NVS mirror so the
+		 * previous power-off is still reported after a pin reset or battery loss. */
+		sys_read(POWER_OFF_LOG_ID, &retained->power_off_log, sizeof(retained->power_off_log));
 		retained_update();
 	} else {
 		LOG_INF("Validated RAM");
@@ -655,7 +658,7 @@ static void button_thread(void)
 				if (test_mode_get()) {
 					LOG_INF("Button reboot blocked by test mode");
 				} else {
-					sys_request_system_reboot(false);
+					sys_request_system_reboot(false, SYS_OFF_REASON_USER_BUTTON);
 				}
 			}
 #if CONFIG_USER_EXTRA_ACTIONS // TODO: extra actions are default until server can send commands to trackers
@@ -779,9 +782,9 @@ int sys_user_shutdown(void)
 		set_led(SYS_LED_PATTERN_OFF_FORCE, SYS_LED_PRIORITY_HIGHEST);
 	}
 #if USER_SHUTDOWN_ENABLED
-	sys_request_system_off(false);
+	sys_request_system_off(false, SYS_OFF_REASON_USER_BUTTON);
 #else
-	sys_request_system_reboot(false);
+	sys_request_system_reboot(false, SYS_OFF_REASON_USER_BUTTON);
 #endif
 	return 0;
 }
@@ -792,7 +795,7 @@ void sys_command_shutdown(void)
 	reboot_counter_write(0);
 	set_led(SYS_LED_PATTERN_ONESHOT_POWEROFF, SYS_LED_PRIORITY_HIGHEST);
 	k_msleep(1500);
-	sys_request_system_off(false);
+	sys_request_system_off(false, SYS_OFF_REASON_COMMAND);
 }
 
 void sys_enter_dfu(bool ota)
@@ -805,16 +808,16 @@ void sys_enter_dfu(bool ota)
 		return;
 	}
 	LOG_INF("MCUboot serial recovery requested");
-	sys_request_system_reboot(false);
+	sys_request_system_reboot(false, SYS_OFF_REASON_DFU);
 #elif ADAFRUIT_BOOTLOADER
 	NRF_POWER->GPREGRET = ota ? ADAFRUIT_DFU_MAGIC_OTA_RESET : ADAFRUIT_DFU_MAGIC_UF2_RESET;
 	k_msleep(100);
-	sys_request_system_reboot(false);
+	sys_request_system_reboot(false, SYS_OFF_REASON_DFU);
 #elif NRF5_BOOTLOADER
 	ARG_UNUSED(ota);
 	gpio_pin_configure(gpio_dev, 19, GPIO_OUTPUT | GPIO_OUTPUT_INIT_LOW);
 	k_msleep(100);
-	sys_request_system_reboot(false);
+	sys_request_system_reboot(false, SYS_OFF_REASON_DFU);
 #else
 	ARG_UNUSED(ota);
 #endif

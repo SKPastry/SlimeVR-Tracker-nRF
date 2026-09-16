@@ -120,6 +120,12 @@ void watchdog_mark_boot_success(void);
 uint8_t watchdog_get_ota_gpregret(void);
 
 /**
+ * @brief Get the RESETREAS value captured at boot (before it was cleared)
+ * @return Raw RESETREAS register value of this boot
+ */
+uint32_t watchdog_get_boot_resetreas(void);
+
+/**
  * @brief Suspend all watchdog channels before entering low power mode
  */
 void watchdog_suspend_all(void);
@@ -157,6 +163,7 @@ static inline uint8_t watchdog_get_reset_count(void) { return 0; }
 static inline void watchdog_clear_reset_count(void) {}
 static inline void watchdog_mark_boot_success(void) {}
 static inline uint8_t watchdog_get_ota_gpregret(void) { return 0; }
+static inline uint32_t watchdog_get_boot_resetreas(void) { return 0; }
 static inline void watchdog_suspend_all(void) {}
 static inline void watchdog_resume_all(void) {}
 static inline const char *watchdog_get_channel_name(wdt_channel_id_t channel)
