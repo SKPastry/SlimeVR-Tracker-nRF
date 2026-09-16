@@ -43,7 +43,24 @@ void sensor_retained_write(void);
 void sensor_record_wom_sleep(void);
 
 void sensor_shutdown(void);
-uint8_t sensor_setup_WOM(void);
+
+/* Outcome of arming IMU wake-on-motion (kept in the power-off record). */
+enum sensor_wom_result {
+	SENSOR_WOM_NOT_ATTEMPTED = 0,
+	SENSOR_WOM_VERIFIED,      /* driver read the wake-up registers back and they match */
+	SENSOR_WOM_UNVERIFIED,    /* setup reported success, driver has no read-back */
+	SENSOR_WOM_SETUP_FAILED,  /* no IMU or bus error while configuring */
+	SENSOR_WOM_VERIFY_FAILED, /* read-back mismatch after retry */
+};
+#define SENSOR_WOM_REGS 4
+
+/* Arms IMU wake-on-motion. Returns the int0 pull/sense pack (pull << 4 | sense),
+ * or 0xFF when wake-up could not be armed or verified. result and regs (read
+ * back wake-up registers, driver specific order) are always filled in. */
+uint8_t sensor_setup_WOM(uint8_t *result, uint8_t regs[SENSOR_WOM_REGS]);
+int sensor_get_imu_id(void);
+/* POWER_OFF_WOM_FLAG_* bits describing the current session (see retained.h). */
+uint8_t sensor_get_wom_session_flags(void);
 
 void sensor_set_mag_enabled(bool enabled);
 bool sensor_get_mag_enabled(void);
@@ -160,9 +177,12 @@ typedef struct sensor_imu {
 	float (*temp_read)(void);                                     // deg C
 
 	uint8_t (*setup_DRDY)(uint16_t);
-	uint8_t (*setup_WOM)(void);
+	uint8_t (*setup_WOM)(void); // return int0 pull << 4 | sense, 0xFF on communication error
 
 	int (*ext_setup)(enum sensor_ext_mode mode); // select auxiliary route; 0 on success, negative on error/unsupported
+
+	int (*verify_WOM)(uint8_t *regs, size_t len); // optional: read back wake-up registers into regs, return 0 if
+												  // wake-up is armed, negative otherwise
 } sensor_imu_t;
 
 typedef struct sensor_mag {

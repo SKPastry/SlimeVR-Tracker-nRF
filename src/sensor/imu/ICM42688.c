@@ -444,6 +444,7 @@ uint8_t icm_setup_WOM(void)
 	err |= ssi_reg_write_byte(SENSOR_INTERFACE_DEV_IMU, ICM42688_SMD_CONFIG, 0x01); // enable WOM feature
 	if (err) {
 		LOG_ERR("Communication error");
+		return 0xFF;
 	}
 	return NRF_GPIO_PIN_PULLUP << 4 | NRF_GPIO_PIN_SENSE_LOW; // active low
 }

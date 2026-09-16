@@ -30,6 +30,8 @@
 #define ICM45686_FIFO_CONFIG3 0x21
 
 #define ICM45686_TMST_WOM_CONFIG 0x23
+#define ICM45686_WOM_CONFIG 0x14     // WOM_EN | WOM_INT_MODE
+#define ICM45686_WOM_INT1_ROUTE 0x0E // INT1_STATUS_EN_WOM_X/Y/Z
 
 #define ICM45686_RTC_CONFIG 0x26
 
@@ -226,6 +228,7 @@ float icm45_temp_read(void);
 
 uint8_t icm45_setup_DRDY(uint16_t threshold);
 uint8_t icm45_setup_WOM(void);
+int icm45_verify_WOM(uint8_t *regs, size_t len);
 
 int icm45_ext_setup(enum sensor_ext_mode mode);
 

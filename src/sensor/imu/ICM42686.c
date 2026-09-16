@@ -510,6 +510,7 @@ uint8_t icm42686_setup_WOM(void)
 
 	if (err) {
 		LOG_ERR("Communication error");
+		return 0xFF;
 	}
 
 	return NRF_GPIO_PIN_PULLUP << 4 | NRF_GPIO_PIN_SENSE_LOW;

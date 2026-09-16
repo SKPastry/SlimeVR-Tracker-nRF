@@ -609,8 +609,33 @@ uint8_t lsm_setup_WOM(void)
 	); // INT H_LACTIVE active low, PP_OD open-drain
 	if (err) {
 		LOG_ERR("Communication error");
+		return 0xFF;
 	}
 	return NRF_GPIO_PIN_PULLUP << 4 | NRF_GPIO_PIN_SENSE_LOW; // active low
+}
+
+int lsm_verify_WOM(uint8_t *regs, size_t len)
+{
+	uint8_t v[4] = {0};
+	int err = ssi_reg_read_byte(SENSOR_INTERFACE_DEV_IMU, LSM6DSV_CTRL1, &v[0]);
+	err |= ssi_reg_read_byte(SENSOR_INTERFACE_DEV_IMU, LSM6DSV_MD1_CFG, &v[1]);
+	err |= ssi_reg_read_byte(SENSOR_INTERFACE_DEV_IMU, LSM6DSV_FUNCTIONS_ENABLE, &v[2]);
+	err |= ssi_reg_read_byte(SENSOR_INTERFACE_DEV_IMU, LSM6DSV_WAKE_UP_THS, &v[3]);
+	memcpy(regs, v, MIN(len, sizeof(v)));
+	if (err) {
+		LOG_ERR("Communication error");
+		return err;
+	}
+	// accel LP1 @ 240Hz, wake-up routed to INT1, INTERRUPTS_ENABLE, threshold
+	bool armed = (v[0] & 0x7F) == (OP_MODE_XL_LP1 << 4 | ODR_240Hz)
+		&& (v[1] & 0x20) == 0x20
+		&& (v[2] & 0x80) == 0x80
+		&& (v[3] & 0x3F) == 0x04;
+	if (!armed) {
+		LOG_ERR("WOM not armed: CTRL1 %02X MD1_CFG %02X FUNCTIONS_ENABLE %02X WAKE_UP_THS %02X", v[0], v[1], v[2], v[3]);
+		return -1;
+	}
+	return 0;
 }
 
 int lsm_ext_setup(enum sensor_ext_mode mode)
@@ -846,6 +871,8 @@ const sensor_imu_t sensor_imu_lsm6dsv = {
 	lsm_setup_WOM,
 
 	lsm_ext_setup,
+
+	lsm_verify_WOM,
 };
 
 const sensor_ext_ssi_t sensor_ext_lsm6dsv = {lsm_ext_write, lsm_ext_write_read, 8};

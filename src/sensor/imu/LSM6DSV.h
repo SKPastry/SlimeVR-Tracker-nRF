@@ -148,6 +148,7 @@ float lsm_temp_read(void);
 
 uint8_t lsm_setup_DRDY(uint16_t threshold);
 uint8_t lsm_setup_WOM(void);
+int lsm_verify_WOM(uint8_t *regs, size_t len);
 
 int lsm_ext_setup(enum sensor_ext_mode mode);
 

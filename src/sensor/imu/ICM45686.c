@@ -720,7 +720,6 @@ uint8_t icm45_setup_WOM(void) // TODO: check if working
 	ssi_reg_write_byte(SENSOR_INTERFACE_DEV_IMU, ICM45686_FIFO_CONFIG0, 0x00); // bypass mode flushes FIFO
 
 	uint8_t interrupts;
-	uint8_t ireg_buf[5];
 	int err = ssi_reg_read_byte(
 		SENSOR_INTERFACE_DEV_IMU,
 		ICM45686_INT1_STATUS0,
@@ -739,31 +738,52 @@ uint8_t icm45_setup_WOM(void) // TODO: check if working
 	err |= ssi_reg_write_byte(SENSOR_INTERFACE_DEV_IMU, ICM45686_PWR_MGMT0, ACCEL_MODE_LP); // set accel and gyro modes
 	last_accel_mode = 0xff;
 	last_gyro_mode = 0xff;
-	ireg_buf[0] = ICM45686_IPREG_SYS2; // address is a word, icm is big endian
-	ireg_buf[1] = ICM45686_IPREG_SYS2_REG_129;
-	ireg_buf[2] = 0x00; // set ACCEL_LP_AVG_SEL to 1x
-	err |= ssi_burst_write(SENSOR_INTERFACE_DEV_IMU, ICM45686_IREG_ADDR_15_8, ireg_buf, 3); // write buffer
+	err |= icm45_bank_write_byte(ICM45686_IPREG_SYS2, ICM45686_IPREG_SYS2_REG_129, 0x00); // set ACCEL_LP_AVG_SEL to 1x
 	// should already be defaulted to AULP
-	//	ireg_buf[0] = ICM45686_IPREG_TOP1;
-	//	ireg_buf[1] = ICM45686_SMC_CONTROL_0;
-	//	ireg_buf[2] = 0x60; // set ACCEL_LP_CLK_SEL to AULP
-	//	err |= ssi_burst_write(SENSOR_INTERFACE_DEV_IMU, ICM45686_IREG_ADDR_15_8, ireg_buf, 3); // write buffer
-	ireg_buf[0] = ICM45686_IPREG_TOP1;
-	ireg_buf[1] = ICM45686_ACCEL_WOM_X_THR;
-	ireg_buf[2] = 0x07; // set wake thresholds // 7 x 3.9 mg is ~27.3 mg
-	ireg_buf[3] = 0x07; // set wake thresholds
-	ireg_buf[4] = 0x07; // set wake thresholds
-	err |= ssi_burst_write(SENSOR_INTERFACE_DEV_IMU, ICM45686_IREG_ADDR_15_8, ireg_buf, 5); // write buffer
+	//	err |= icm45_bank_write_byte(ICM45686_IPREG_TOP1, ICM45686_SMC_CONTROL_0, 0x60); // set ACCEL_LP_CLK_SEL to AULP
+	/* IREG writes must be one 3-byte burst per byte (address + data) with a 4us gap; a longer
+	 * burst continues past IREG_DATA into REG_MISC2 (SOFT_RST) and REG_MISC2+1 instead. */
+	const uint8_t wom_thr[3] = {0x07, 0x07, 0x07}; // set wake thresholds // 7 x 3.9 mg is ~27.3 mg
+	err |= icm45_bank_write(ICM45686_IPREG_TOP1, ICM45686_ACCEL_WOM_X_THR, wom_thr, sizeof(wom_thr));
 	err |= ssi_reg_write_byte(
 		SENSOR_INTERFACE_DEV_IMU,
 		ICM45686_TMST_WOM_CONFIG,
-		0x14
+		ICM45686_WOM_CONFIG
 	); // enable WOM, enable WOM interrupt
-	err |= ssi_reg_write_byte(SENSOR_INTERFACE_DEV_IMU, ICM45686_INT1_CONFIG1, 0x0E); // route WOM interrupt
+	err |= ssi_reg_write_byte(SENSOR_INTERFACE_DEV_IMU, ICM45686_INT1_CONFIG1, ICM45686_WOM_INT1_ROUTE); // route WOM interrupt
 	if (err) {
 		LOG_ERR("Communication error");
+		return 0xFF;
 	}
 	return NRF_GPIO_PIN_PULLUP << 4 | NRF_GPIO_PIN_SENSE_LOW; // active low
+}
+
+int icm45_verify_WOM(uint8_t *regs, size_t len)
+{
+	uint8_t v[4] = {0};
+	uint8_t thr[3] = {0};
+	int err = ssi_reg_read_byte(SENSOR_INTERFACE_DEV_IMU, ICM45686_PWR_MGMT0, &v[0]);
+	err |= ssi_reg_read_byte(SENSOR_INTERFACE_DEV_IMU, ICM45686_TMST_WOM_CONFIG, &v[1]);
+	err |= ssi_reg_read_byte(SENSOR_INTERFACE_DEV_IMU, ICM45686_INT1_CONFIG1, &v[2]);
+	err |= ssi_reg_read_byte(SENSOR_INTERFACE_DEV_IMU, ICM45686_ACCEL_CONFIG0, &v[3]);
+	err |= icm45_bank_read(ICM45686_IPREG_TOP1, ICM45686_ACCEL_WOM_X_THR, thr, sizeof(thr));
+	memcpy(regs, v, MIN(len, sizeof(v)));
+	if (err) {
+		LOG_ERR("Communication error");
+		return err;
+	}
+	// accel LP + gyro off, WOM_EN + WOM_INT_MODE, WOM X/Y/Z on INT1, accel FS/ODR, thresholds
+	bool armed = (v[0] & 0x0F) == ACCEL_MODE_LP
+		&& (v[1] & ICM45686_WOM_CONFIG) == ICM45686_WOM_CONFIG
+		&& (v[2] & ICM45686_WOM_INT1_ROUTE) == ICM45686_WOM_INT1_ROUTE
+		&& (v[3] & 0x7F) == (ACCEL_UI_FS_SEL_8G << 4 | ACCEL_ODR_200Hz)
+		&& thr[0] == 0x07 && thr[1] == 0x07 && thr[2] == 0x07;
+	if (!armed) {
+		LOG_ERR("WOM not armed: PWR_MGMT0 %02X TMST_WOM_CONFIG %02X INT1_CONFIG1 %02X ACCEL_CONFIG0 %02X THR %02X %02X %02X",
+				v[0], v[1], v[2], v[3], thr[0], thr[1], thr[2]);
+		return -1;
+	}
+	return 0;
 }
 
 /** Wait for I2CM to become idle */
@@ -1107,4 +1127,6 @@ const sensor_imu_t sensor_imu_icm45686 = {
 	icm45_setup_WOM,
 
 	icm45_ext_setup,
+
+	icm45_verify_WOM,
 };

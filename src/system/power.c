@@ -27,6 +27,7 @@
 #include <hal/nrf_twim.h>
 #include <zephyr/drivers/clock_control/nrf_clock_control.h>
 #include <stdint.h>
+#include <string.h>
 #include <errno.h>
 
 #include "power.h"
@@ -46,9 +47,9 @@ LOG_MODULE_REGISTER(power, LOG_LEVEL_INF);
 
 #include "nrf_gpio_util.h" /* after LOG_MODULE_REGISTER: helpers use LOG_INF */
 
-static bool sys_WOM(bool force);
-static bool sys_system_off(void);
-static void sys_system_reboot(void);
+static bool sys_WOM(bool force, enum sys_off_reason reason);
+static bool sys_system_off(enum sys_off_reason reason);
+static void sys_system_reboot(enum sys_off_reason reason);
 
 enum sys_power_request {
 	SYS_POWER_REQ_NONE = 0,
@@ -58,9 +59,15 @@ enum sys_power_request {
 	SYS_POWER_REQ_REBOOT = 4,
 };
 
-static int sys_power_state_request(enum sys_power_request id);
-static enum sys_power_request sys_power_state_peek(void);
+static int sys_power_state_request(enum sys_power_request id, enum sys_off_reason reason);
+static enum sys_power_request sys_power_state_peek(enum sys_off_reason *reason);
 static void sys_power_state_clear(void);
+
+/* Battery voltage captured for the power-off record */
+static int last_battery_mV = 0;
+static bool power_off_recorded = false;
+static void power_off_record(enum power_off_path path, enum sys_off_reason reason, uint8_t wom_result,
+			     const uint8_t *wom_regs, uint8_t int0_config, uint32_t int0_pin_cnf);
 
 K_THREAD_DEFINE(disable_DFU_thread_id, 128, sys_skip_dfu, NULL, NULL, NULL, DISABLE_DFU_THREAD_PRIORITY, 0, 500); // skip DFU if the system is running correctly
 
@@ -323,42 +330,171 @@ static void wait_for_logging(void)
 static int64_t system_off_timeout = 0;
 #endif
 
-void sys_request_WOM(bool force, bool immediate)
+void sys_request_WOM(bool force, bool immediate, enum sys_off_reason reason)
 {
 	if (immediate)
 	{
-		sys_WOM(force);
+		sys_WOM(force, reason);
 		return;
 	}
 	if (force) {
-		sys_power_state_request(SYS_POWER_REQ_WOM_FORCE);
+		sys_power_state_request(SYS_POWER_REQ_WOM_FORCE, reason);
 	} else {
-		sys_power_state_request(SYS_POWER_REQ_WOM);
+		sys_power_state_request(SYS_POWER_REQ_WOM, reason);
 	}
 }
 
-void sys_request_system_off(bool immediate)
+void sys_request_system_off(bool immediate, enum sys_off_reason reason)
 {
 	if (immediate)
 	{
-		sys_system_off();
+		sys_system_off(reason);
 		return;
 	}
-	sys_power_state_request(SYS_POWER_REQ_SYSTEM_OFF);
+	sys_power_state_request(SYS_POWER_REQ_SYSTEM_OFF, reason);
 }
 
-void sys_request_system_reboot(bool immediate)
+void sys_request_system_reboot(bool immediate, enum sys_off_reason reason)
 {
 	if (immediate)
 	{
-		sys_system_reboot();
+		sys_system_reboot(reason);
 		return;
 	}
-	sys_power_state_request(SYS_POWER_REQ_REBOOT);
+	sys_power_state_request(SYS_POWER_REQ_REBOOT, reason);
+}
+
+static const char *const sys_off_reason_names[SYS_OFF_REASON_COUNT] = {
+	[SYS_OFF_REASON_UNKNOWN] = "unknown",
+	[SYS_OFF_REASON_ACTIVITY_TIMEOUT] = "activity_timeout",
+	[SYS_OFF_REASON_IDLE_WAKE_TIMEOUT] = "idle_wake_timeout",
+	[SYS_OFF_REASON_IMU_TIMEOUT] = "imu_timeout",
+	[SYS_OFF_REASON_CONNECTION_TIMEOUT] = "connection_timeout",
+	[SYS_OFF_REASON_PAIRING_TIMEOUT] = "pairing_timeout",
+	[SYS_OFF_REASON_COMMAND] = "command",
+	[SYS_OFF_REASON_BATTERY_EMPTY] = "battery_empty",
+	[SYS_OFF_REASON_DOCKED] = "docked",
+	[SYS_OFF_REASON_USER_BUTTON] = "user_button",
+	[SYS_OFF_REASON_BOOT_DEBOUNCE] = "boot_debounce",
+	[SYS_OFF_REASON_WOM_SETUP_FAILED] = "wom_setup_failed",
+	[SYS_OFF_REASON_SENSOR_FAILURE] = "sensor_failure",
+	[SYS_OFF_REASON_MAG_TOGGLE] = "mag_toggle",
+	[SYS_OFF_REASON_DFU] = "dfu",
+	[SYS_OFF_REASON_OTA] = "ota",
+};
+
+const char *sys_off_reason_name(enum sys_off_reason reason)
+{
+	if (reason >= SYS_OFF_REASON_COUNT || sys_off_reason_names[reason] == NULL) {
+		return "invalid";
+	}
+	return sys_off_reason_names[reason];
+}
+
+static const char *power_off_path_name(uint8_t path)
+{
+	switch (path) {
+	case POWER_OFF_PATH_WOM:
+		return "wom";
+	case POWER_OFF_PATH_SYSTEM_OFF:
+		return "system_off";
+	case POWER_OFF_PATH_REBOOT:
+		return "reboot";
+	default:
+		return "none";
+	}
+}
+
+static const char *sensor_wom_result_name(uint8_t result)
+{
+	switch (result) {
+	case SENSOR_WOM_NOT_ATTEMPTED:
+		return "not_attempted";
+	case SENSOR_WOM_VERIFIED:
+		return "verified";
+	case SENSOR_WOM_UNVERIFIED:
+		return "unverified";
+	case SENSOR_WOM_SETUP_FAILED:
+		return "setup_failed";
+	case SENSOR_WOM_VERIFY_FAILED:
+		return "verify_failed";
+	default:
+		return "invalid";
+	}
+}
+
+/* Append a power-off record to the retained ring and mirror it to NVS. Must be
+ * called before sys_poweroff()/sys_reboot(); the next boot prints it. */
+static void power_off_record(enum power_off_path path, enum sys_off_reason reason, uint8_t wom_result,
+			     const uint8_t *wom_regs, uint8_t int0_config, uint32_t int0_pin_cnf)
+{
+	struct power_off_log *log = &retained->power_off_log;
+	if (log->magic != POWER_OFF_LOG_MAGIC || log->next >= POWER_OFF_LOG_DEPTH || log->count > POWER_OFF_LOG_DEPTH) {
+		memset(log, 0, sizeof(*log));
+		log->magic = POWER_OFF_LOG_MAGIC;
+	}
+	struct power_off_record *rec = &log->rec[log->next];
+	memset(rec, 0, sizeof(*rec));
+	rec->seq = ++log->seq;
+	rec->path = path;
+	rec->reason = reason;
+	rec->wom_result = wom_result;
+	int imu_id = sensor_get_imu_id();
+	rec->imu_id = imu_id < 0 ? 0xFF : (uint8_t)imu_id;
+	rec->int0_config = int0_config;
+	rec->wom_flags = sensor_get_wom_session_flags();
+	if (wom_regs) {
+		memcpy(rec->wom_regs, wom_regs, sizeof(rec->wom_regs));
+	}
+	rec->idle_wake_streak = retained->wom_idle_wake_streak;
+	rec->wdt_reset_count = watchdog_get_reset_count();
+	int16_t pptt = power_battery_current_pptt();
+	rec->battery_pct = pptt < 0 ? 0xFF : (uint8_t)(pptt / 100);
+	rec->battery_mv = (uint16_t)CLAMP(last_battery_mV, 0, UINT16_MAX);
+	rec->int0_pin_cnf = int0_pin_cnf;
+	rec->boot_resetreas = watchdog_get_boot_resetreas();
+	rec->uptime_s = (uint32_t)(k_uptime_get() / 1000);
+	log->next = (log->next + 1) % POWER_OFF_LOG_DEPTH;
+	if (log->count < POWER_OFF_LOG_DEPTH) {
+		log->count++;
+	}
+	power_off_recorded = true;
+	LOG_INF("Power-off record #%u: path=%s reason=%s wom=%s", rec->seq, power_off_path_name(rec->path),
+		sys_off_reason_name(rec->reason), sensor_wom_result_name(rec->wom_result));
+	/* Retained RAM is outside the CRC; NVS mirror survives pin reset / battery removal. */
+	sys_write(POWER_OFF_LOG_ID, NULL, log, sizeof(*log));
+}
+
+static void power_off_record_print(const struct power_off_record *rec, const char *prefix)
+{
+	LOG_INF("%s #%u: path=%s reason=%s wom=%s imu=%u regs=%02X %02X %02X %02X int0_cfg=0x%02X pin_cnf=0x%08X",
+		prefix, rec->seq, power_off_path_name(rec->path), sys_off_reason_name(rec->reason),
+		sensor_wom_result_name(rec->wom_result), rec->imu_id, rec->wom_regs[0], rec->wom_regs[1], rec->wom_regs[2],
+		rec->wom_regs[3], rec->int0_config, rec->int0_pin_cnf);
+	LOG_INF("%s #%u: batt=%umV/%u%% wom_flags=0x%02X idle_streak=%u wdt=%u resetreas=0x%08X uptime=%us", prefix,
+		rec->seq, rec->battery_mv, rec->battery_pct, rec->wom_flags, rec->idle_wake_streak, rec->wdt_reset_count,
+		rec->boot_resetreas, rec->uptime_s);
+}
+
+void sys_power_off_log_print(bool all)
+{
+	const struct power_off_log *log = &retained->power_off_log;
+	if (log->magic != POWER_OFF_LOG_MAGIC || log->count == 0 || log->count > POWER_OFF_LOG_DEPTH
+	    || log->next >= POWER_OFF_LOG_DEPTH) {
+		LOG_INF("Last power-off: no record");
+		return;
+	}
+	uint8_t shown = all ? log->count : 1;
+	for (uint8_t i = 0; i < shown; i++) {
+		/* newest first */
+		uint8_t idx = (log->next + POWER_OFF_LOG_DEPTH - 1 - i) % POWER_OFF_LOG_DEPTH;
+		power_off_record_print(&log->rec[idx], i == 0 ? "Last power-off" : "Earlier power-off");
+	}
+	LOG_INF("This boot: resetreas=0x%08X wdt_resets=%u", watchdog_get_boot_resetreas(), watchdog_get_reset_count());
 }
 
 /* Returns true when the power request is consumed; false to keep it queued. */
-static bool sys_WOM(bool force) // TODO: if IMU interrupt does not exist what does the system do?
+static bool sys_WOM(bool force, enum sys_off_reason reason) // TODO: if IMU interrupt does not exist what does the system do?
 {
 	LOG_INF("IMU wake up requested");
 	/* Block sleep during OTA (active or suppressed) */
@@ -391,14 +527,18 @@ static bool sys_WOM(bool force) // TODO: if IMU interrupt does not exist what do
 	set_regulator(SYS_REGULATOR_LDO); // Switch to LDO
 #endif
 	// Set system off
-	uint8_t pin_config = sensor_setup_WOM(); // enable WOM feature
+	uint8_t wom_result = SENSOR_WOM_NOT_ATTEMPTED;
+	uint8_t wom_regs[SENSOR_WOM_REGS] = {0};
+	uint8_t pin_config = sensor_setup_WOM(&wom_result, wom_regs); // enable WOM feature, verified by read-back
 	if (pin_config == 0xFF) {
-		/* Already past configure_system_off; cannot restore cleanly. */
-		LOG_ERR("IMU wake up setup failed after shutdown prep, rebooting");
-		sys_request_system_reboot(true);
+		/* Already past configure_system_off; cannot restore cleanly. Never enter
+		 * System OFF with wake-up unarmed: that sleep could only be ended by the button. */
+		LOG_ERR("IMU wake up setup failed after shutdown prep (%s), rebooting", sensor_wom_result_name(wom_result));
+		power_off_record(POWER_OFF_PATH_WOM, reason, wom_result, wom_regs, 0xFF, 0);
+		sys_system_reboot(SYS_OFF_REASON_WOM_SETUP_FAILED);
 		return true;
 	}
-	LOG_INF("Configured IMU wake up");
+	LOG_INF("Configured IMU wake up (%s)", sensor_wom_result_name(wom_result));
 #if CONFIG_SENSOR_FAST_WOM_WAKE && NRF_POWER_HAS_GPREGRET \
 	&& (defined(POWER_GPREGRET2_GPREGRET_Msk) || defined(POWER_GPREGRET_MaxCount))
 	if (pin_config != 0)
@@ -410,7 +550,10 @@ static bool sys_WOM(bool force) // TODO: if IMU interrupt does not exist what do
 		pin_config);
 	nrf_gpio_cfg_input(int0_gpios, (pin_config >> 4) & 0xF);
 	nrf_gpio_cfg_sense_set(int0_gpios, pin_config & 0xF);
-	LOG_INF("Configured IMU wake up GPIO");
+	uint32_t int0_pin = int0_gpios;
+	uint32_t int0_pin_cnf = nrf_gpio_pin_port_decode(&int0_pin)->PIN_CNF[int0_pin];
+	LOG_INF("Configured IMU wake up GPIO (PIN_CNF 0x%08X)", int0_pin_cnf);
+	power_off_record(POWER_OFF_PATH_WOM, reason, wom_result, wom_regs, pin_config, int0_pin_cnf);
 	LOG_INF("Powering off nRF");
 	sys_update_battery_tracker(power_battery_current_pptt(), power_battery_device_plugged());
 //	retained_update();
@@ -421,6 +564,7 @@ static bool sys_WOM(bool force) // TODO: if IMU interrupt does not exist what do
 	sys_poweroff();
 	return true;
 #else
+	ARG_UNUSED(reason);
 	LOG_WRN("IMU wake up GPIO does not exist");
 	LOG_WRN("IMU wake up not available");
 	return true;
@@ -428,9 +572,9 @@ static bool sys_WOM(bool force) // TODO: if IMU interrupt does not exist what do
 }
 
 /* Returns true when the request is consumed; false to keep it queued. */
-static bool sys_system_off(void) // TODO: add timeout
+static bool sys_system_off(enum sys_off_reason reason) // TODO: add timeout
 {
-	LOG_INF("System off requested");
+	LOG_INF("System off requested (%s)", sys_off_reason_name(reason));
 	/* Block shutdown during OTA (active or suppressed) */
 	if (esb_ota_is_active() || connection_get_ota_suppressed()) {
 		LOG_INF("System off blocked by OTA");
@@ -454,9 +598,14 @@ static bool sys_system_off(void) // TODO: add timeout
 	LOG_INF("Wake up GPIO " NRF_ABS_PIN_LOG_FMT, NRF_ABS_PIN_LOG_ARGS(int0_gpios));
 	nrf_gpio_cfg(int0_gpios, NRF_GPIO_PIN_DIR_INPUT, NRF_GPIO_PIN_INPUT_DISCONNECT, NRF_GPIO_PIN_PULLDOWN, NRF_GPIO_PIN_S0S1, NRF_GPIO_PIN_NOSENSE);
 	LOG_INF("Configured IMU wake-up GPIO idle (pulldown)");
+	uint32_t int0_pin = int0_gpios;
+	uint32_t int0_pin_cnf = nrf_gpio_pin_port_decode(&int0_pin)->PIN_CNF[int0_pin];
+#else
+	uint32_t int0_pin_cnf = 0;
 #endif
 	/* TODO: only an improvement during shutdown? causes higher usage in WOM */
 	sys_disconnect_interface_pins();
+	power_off_record(POWER_OFF_PATH_SYSTEM_OFF, reason, SENSOR_WOM_NOT_ATTEMPTED, NULL, 0xFF, int0_pin_cnf);
 	LOG_INF("Powering off nRF");
 #if CONFIG_DISABLE_SENSOR_GPIOS_ON_SHUTDOWN
 	disconnect_sensor_pins();
@@ -471,9 +620,13 @@ static bool sys_system_off(void) // TODO: add timeout
 	return true;
 }
 
-static void sys_system_reboot(void) // TODO: add timeout
+static void sys_system_reboot(enum sys_off_reason reason) // TODO: add timeout
 {
-	LOG_INF("System reboot requested");
+	LOG_INF("System reboot requested (%s)", sys_off_reason_name(reason));
+	if (!power_off_recorded) {
+		/* A failed IMU wake-up attempt records itself before falling back to a reboot. */
+		power_off_record(POWER_OFF_PATH_REBOOT, reason, SENSOR_WOM_NOT_ATTEMPTED, NULL, 0xFF, 0);
+	}
 	configure_system_off(); // Common subsystem shutdown and prepare sense pins
 	sys_flush_warm(); /* persist warm cal before reboot (covers OTA reboot path) */
 	sensor_calibration_online_mag_cold_start();
@@ -494,9 +647,10 @@ static void sys_system_reboot(void) // TODO: add timeout
 }
 
 static enum sys_power_request power_request = SYS_POWER_REQ_NONE;
+static enum sys_off_reason power_request_reason = SYS_OFF_REASON_UNKNOWN;
 static K_SEM_DEFINE(power_wake_sem, 0, 1);
 
-static int sys_power_state_request(enum sys_power_request id)
+static int sys_power_state_request(enum sys_power_request id, enum sys_off_reason reason)
 {
 	if (id == SYS_POWER_REQ_NONE) {
 		return -1;
@@ -505,13 +659,15 @@ static int sys_power_state_request(enum sys_power_request id)
 		LOG_ERR("System is already entering a new power state");
 		return -1;
 	}
+	power_request_reason = reason;
 	power_request = id;
 	k_sem_give(&power_wake_sem);
 	return 0;
 }
 
-static enum sys_power_request sys_power_state_peek(void)
+static enum sys_power_request sys_power_state_peek(enum sys_off_reason *reason)
 {
+	*reason = power_request_reason;
 	return power_request;
 }
 
@@ -554,7 +710,7 @@ static void power_thread(void)
 
 	while (1)
 	{
-		/* Log OTA RAM engine GPREGRET once, after USB console is ready (~5s) */
+		/* Log OTA RAM engine GPREGRET and the previous power-off record once, after USB console is ready (~5s) */
 		if (!ota_gpregret_logged && system_uptime_since_boot_ms() > 5000) {
 			ota_gpregret_logged = true;
 			uint8_t gp = watchdog_get_ota_gpregret();
@@ -563,6 +719,7 @@ static void power_thread(void)
 			} else if (gp >= 0xD0 && gp < 0xDE) {
 				LOG_WRN("OTA RAM engine GPREGRET=0x%02X (last stage before reset)", gp);
 			}
+			sys_power_off_log_print(false);
 		}
 
 		/* After 60 seconds of successful operation, mark boot as successful.
@@ -589,20 +746,21 @@ static void power_thread(void)
 		const struct device *const uart = DEVICE_DT_GET(DT_NODELABEL(uart0));
 		pm_device_action_run(uart, PM_DEVICE_ACTION_SUSPEND);
 #endif
-		enum sys_power_request requested = sys_power_state_peek();
+		enum sys_off_reason requested_reason;
+		enum sys_power_request requested = sys_power_state_peek(&requested_reason);
 		bool consumed = true;
 		switch (requested) {
 		case SYS_POWER_REQ_WOM:
-			consumed = sys_WOM(false);
+			consumed = sys_WOM(false, requested_reason);
 			break;
 		case SYS_POWER_REQ_WOM_FORCE:
-			consumed = sys_WOM(true);
+			consumed = sys_WOM(true, requested_reason);
 			break;
 		case SYS_POWER_REQ_SYSTEM_OFF:
-			consumed = sys_system_off();
+			consumed = sys_system_off(requested_reason);
 			break;
 		case SYS_POWER_REQ_REBOOT:
-			sys_system_reboot();
+			sys_system_reboot(requested_reason);
 			break;
 		case SYS_POWER_REQ_NONE:
 		default:
@@ -646,6 +804,7 @@ static void power_thread(void)
 		int32_t average_pptt = power_battery_average_pptt();
 		bool battery_discharged = !plug_signal_settling && battery_available
 			&& (average_pptt >= 0 ? average_pptt : battery_pptt) == 0;
+		last_battery_mV = battery_mV;
 
 		power_battery_set_charged(charged); // TODO: timer on device_plugged could be used to infer charged state
 		bool device_plugged = power_battery_device_plugged();
@@ -674,7 +833,8 @@ static void power_thread(void)
 				LOG_WRN("Discharged battery");
 				sys_update_battery_tracker(0, device_plugged);
 			}
-			sys_request_system_off(true);
+			/* Genuinely empty battery / docked: full system off (no motion wake) is intended. */
+			sys_request_system_off(true, battery_discharged ? SYS_OFF_REASON_BATTERY_EMPTY : SYS_OFF_REASON_DOCKED);
 		}
 
 		power_battery_feed_and_track(battery_pptt_valid, plug_signal_settling, battery_pptt,

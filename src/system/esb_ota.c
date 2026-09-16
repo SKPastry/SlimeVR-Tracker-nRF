@@ -691,7 +691,7 @@ int esb_ota_handle_activate(void)
 
 	LOG_INF("OTA: About to activate staged image");
 #if OTA_USE_MCUBOOT
-	sys_request_system_reboot(false);
+	sys_request_system_reboot(false, SYS_OFF_REASON_OTA);
 #else
 	LOG_INF("OTA: staging=0x%05X final=0x%05X size=%u",
 		ota.staging_base, ota.target_flash_base, ota.image_size);
@@ -701,7 +701,7 @@ int esb_ota_handle_activate(void)
 	esb_ota_flash_copy_and_reset(ota.staging_base, ota.target_flash_base, ota.image_size);
 
 	/* If first page wasn't deferred, just reboot */
-	sys_request_system_reboot(false);
+	sys_request_system_reboot(false, SYS_OFF_REASON_OTA);
 #endif
 
 	/* Should not reach here */
@@ -731,7 +731,7 @@ void esb_ota_handle_abort(void)
 #if CONFIG_BUILD_OUTPUT_UF2 && !CONFIG_BOOTLOADER_MCUBOOT
 	NRF_POWER->GPREGRET = ADAFRUIT_DFU_MAGIC_UF2_RESET;
 #endif
-	sys_request_system_reboot(false);
+	sys_request_system_reboot(false, SYS_OFF_REASON_OTA);
 }
 
 void esb_ota_check_timeout(void)
@@ -750,7 +750,7 @@ void esb_ota_check_timeout(void)
 #if CONFIG_BUILD_OUTPUT_UF2 && !CONFIG_BOOTLOADER_MCUBOOT
 		NRF_POWER->GPREGRET = ADAFRUIT_DFU_MAGIC_UF2_RESET;
 #endif
-		sys_request_system_reboot(false);
+		sys_request_system_reboot(false, SYS_OFF_REASON_OTA);
 	}
 }
 

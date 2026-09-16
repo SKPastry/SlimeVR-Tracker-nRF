@@ -313,7 +313,7 @@ static void esb_remote_cmd_test_mode_off(void)
 static void esb_remote_cmd_reboot(void)
 {
 	LOG_WRN("Executing remote command: REBOOT");
-	sys_request_system_reboot(false);
+	sys_request_system_reboot(false, SYS_OFF_REASON_COMMAND);
 }
 
 static void esb_remote_cmd_clear(void)
@@ -1770,7 +1770,7 @@ void esb_pair(void)
 			if (!shutdown_requested && (k_uptime_get() - pair_start_time) > CONFIG_CONNECTION_TIMEOUT_DELAY) {
 				LOG_WRN("Pairing timeout after %dm", CONFIG_CONNECTION_TIMEOUT_DELAY / 60000);
 				shutdown_requested = true;
-				sys_request_system_off(false);
+				sys_request_system_off(false, SYS_OFF_REASON_PAIRING_TIMEOUT);
 			}
 #endif
 			if (paired_addr[0]) {
@@ -2265,7 +2265,7 @@ static void esb_thread(void)
 			{
 				LOG_WRN("No response from receiver in %dm", CONFIG_CONNECTION_TIMEOUT_DELAY / 60000);
 				shutdown_requested = true;
-				sys_request_system_off(false);
+				sys_request_system_off(false, SYS_OFF_REASON_CONNECTION_TIMEOUT);
 			}
 #endif
 		}
